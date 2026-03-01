@@ -860,11 +860,7 @@ async fn test_three_agent_task_coordination() {
     assert!(decision_resp.get("message_id").is_some());
 
     // Non-leader should NOT be able to issue a decision
-    let non_leader = if leader_id == architect.agent_id {
-        &backend
-    } else {
-        &backend
-    };
+    let non_leader = &backend;
     let reject = non_leader
         .send_decision(&room_id, "I override this!", serde_json::json!({}))
         .await;

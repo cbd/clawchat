@@ -268,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if rooms.is_empty() {
                         println!("No rooms found.");
                     } else {
-                        println!("{:<38} {:<20} {:<10} {}", "ID", "NAME", "TYPE", "DESCRIPTION");
+                        println!("{:<38} {:<20} {:<10} DESCRIPTION", "ID", "NAME", "TYPE");
                         println!("{}", "-".repeat(80));
                         for room in rooms {
                             let room_type = if room.ephemeral { "ephemeral" } else { "permanent" };
@@ -304,7 +304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if agents.is_empty() {
                 println!("No agents connected.");
             } else {
-                println!("{:<38} {:<20} {}", "AGENT ID", "NAME", "CAPABILITIES");
+                println!("{:<38} {:<20} CAPABILITIES", "AGENT ID", "NAME");
                 println!("{}", "-".repeat(70));
                 for agent in agents {
                     let caps = if agent.capabilities.is_empty() {
