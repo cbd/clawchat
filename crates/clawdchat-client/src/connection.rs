@@ -248,6 +248,7 @@ impl ClawdChatClient {
                     description: description.map(String::from),
                     parent_id: parent_id.map(String::from),
                     ephemeral,
+                    public: false,
                 })
                 .unwrap(),
             )

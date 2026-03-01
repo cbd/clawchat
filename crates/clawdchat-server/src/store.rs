@@ -29,10 +29,19 @@ impl Store {
 
     fn initialize(&self) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap();
+
+        // Step 1: Create tables (without new columns — old DBs may already have rooms table)
         conn.execute_batch(
             "
             PRAGMA journal_mode = WAL;
             PRAGMA foreign_keys = ON;
+
+            CREATE TABLE IF NOT EXISTS api_keys (
+                api_key    TEXT PRIMARY KEY,
+                tier       TEXT NOT NULL DEFAULT 'free',
+                label      TEXT,
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
 
             CREATE TABLE IF NOT EXISTS rooms (
                 room_id     TEXT PRIMARY KEY,
@@ -41,6 +50,8 @@ impl Store {
                 parent_id   TEXT REFERENCES rooms(room_id) ON DELETE SET NULL,
                 created_by  TEXT,
                 created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                visibility  TEXT NOT NULL DEFAULT 'private',
+                owner_key   TEXT,
                 CHECK (room_id != parent_id)
             );
 
@@ -90,12 +101,37 @@ impl Store {
                 cast_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 PRIMARY KEY (vote_id, agent_id)
             );
-
-            INSERT OR IGNORE INTO rooms (room_id, name, description)
-                VALUES ('lobby', 'lobby', 'Default room for all agents');
             ",
         )?;
+
+        // Step 2: Run migrations (add columns to tables that may have been created by older versions)
+        Self::migrate_add_column(&conn, "rooms", "visibility", "TEXT NOT NULL DEFAULT 'private'");
+        Self::migrate_add_column(&conn, "rooms", "owner_key", "TEXT");
+
+        // Step 3: Seed data (runs after migrations so visibility column is guaranteed to exist)
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO rooms (room_id, name, description, visibility)
+                VALUES ('lobby', 'lobby', 'Default room for all agents', 'public');",
+        )?;
+
+        // Ensure lobby is public (may have been created before visibility existed)
+        conn.execute(
+            "UPDATE rooms SET visibility = 'public' WHERE room_id = 'lobby' AND visibility = 'private'",
+            [],
+        )?;
+
         Ok(())
+    }
+
+    /// Try to add a column to a table; silently ignore if it already exists.
+    fn migrate_add_column(conn: &Connection, table: &str, column: &str, col_type: &str) {
+        let sql = format!("ALTER TABLE {} ADD COLUMN {} {}", table, column, col_type);
+        if let Err(e) = conn.execute_batch(&sql) {
+            let msg = e.to_string();
+            if !msg.contains("duplicate column") {
+                log::debug!("Migration {}.{}: {}", table, column, msg);
+            }
+        }
     }
 
     // --- Room operations ---
@@ -108,10 +144,23 @@ impl Store {
         parent_id: Option<&str>,
         created_by: Option<&str>,
     ) -> Result<Room, StoreError> {
+        self.create_room_with_visibility(room_id, name, description, parent_id, created_by, "private", None)
+    }
+
+    pub fn create_room_with_visibility(
+        &self,
+        room_id: &str,
+        name: &str,
+        description: Option<&str>,
+        parent_id: Option<&str>,
+        created_by: Option<&str>,
+        visibility: &str,
+        owner_key: Option<&str>,
+    ) -> Result<Room, StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO rooms (room_id, name, description, parent_id, created_by) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![room_id, name, description, parent_id, created_by],
+            "INSERT INTO rooms (room_id, name, description, parent_id, created_by, visibility, owner_key) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![room_id, name, description, parent_id, created_by, visibility, owner_key],
         ).map_err(|e| match e {
             rusqlite::Error::SqliteFailure(err, _) if err.extended_code == 2067 => {
                 StoreError::RoomNameTaken(name.to_string())
@@ -132,7 +181,7 @@ impl Store {
     pub fn get_room_by_name(&self, name: &str) -> Result<Option<Room>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT room_id, name, description, parent_id, created_by, created_at FROM rooms WHERE name = ?1",
+            "SELECT room_id, name, description, parent_id, created_by, created_at, visibility, owner_key FROM rooms WHERE name = ?1",
         )?;
 
         let room = stmt.query_row(params![name], map_room_row);
@@ -151,7 +200,7 @@ impl Store {
         match parent_id {
             Some(pid) => {
                 let mut stmt = conn.prepare(
-                    "SELECT room_id, name, description, parent_id, created_by, created_at FROM rooms WHERE parent_id = ?1 ORDER BY name",
+                    "SELECT room_id, name, description, parent_id, created_by, created_at, visibility, owner_key FROM rooms WHERE parent_id = ?1 ORDER BY name",
                 )?;
                 let rows = stmt.query_map(params![pid], map_room_row)?;
                 for row in rows {
@@ -160,7 +209,7 @@ impl Store {
             }
             None => {
                 let mut stmt = conn.prepare(
-                    "SELECT room_id, name, description, parent_id, created_by, created_at FROM rooms ORDER BY name",
+                    "SELECT room_id, name, description, parent_id, created_by, created_at, visibility, owner_key FROM rooms ORDER BY name",
                 )?;
                 let rows = stmt.query_map([], map_room_row)?;
                 for row in rows {
@@ -384,6 +433,99 @@ impl Store {
         Ok(())
     }
 
+    // --- API key operations ---
+
+    pub fn create_api_key(&self, api_key: &str, label: Option<&str>) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO api_keys (api_key, label) VALUES (?1, ?2)",
+            params![api_key, label],
+        )?;
+        Ok(())
+    }
+
+    pub fn validate_api_key(&self, api_key: &str) -> Result<bool, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM api_keys WHERE api_key = ?1",
+            params![api_key],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    pub fn get_key_tier(&self, api_key: &str) -> Result<String, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let tier: String = conn.query_row(
+            "SELECT tier FROM api_keys WHERE api_key = ?1",
+            params![api_key],
+            |row| row.get(0),
+        ).map_err(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => StoreError::Db(e),
+            other => StoreError::Db(other),
+        })?;
+        Ok(tier)
+    }
+
+    pub fn count_rooms_for_key(&self, api_key: &str) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM rooms WHERE owner_key = ?1",
+            params![api_key],
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
+    }
+
+    /// List rooms visible to the given API key: all public rooms + private rooms owned by the key.
+    pub fn list_rooms_for_key(
+        &self,
+        api_key: Option<&str>,
+        parent_id: Option<&str>,
+    ) -> Result<Vec<Room>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut rooms = Vec::new();
+
+        match (parent_id, api_key) {
+            (Some(pid), Some(key)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT room_id, name, description, parent_id, created_by, created_at, visibility, owner_key
+                     FROM rooms WHERE parent_id = ?1 AND (visibility = 'public' OR owner_key = ?2) ORDER BY name",
+                )?;
+                let rows = stmt.query_map(params![pid, key], map_room_row)?;
+                for row in rows { rooms.push(row?); }
+            }
+            (Some(pid), None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT room_id, name, description, parent_id, created_by, created_at, visibility, owner_key
+                     FROM rooms WHERE parent_id = ?1 AND visibility = 'public' ORDER BY name",
+                )?;
+                let rows = stmt.query_map(params![pid], map_room_row)?;
+                for row in rows { rooms.push(row?); }
+            }
+            (None, Some(key)) => {
+                let mut stmt = conn.prepare(
+                    "SELECT room_id, name, description, parent_id, created_by, created_at, visibility, owner_key
+                     FROM rooms WHERE visibility = 'public' OR owner_key = ?1 ORDER BY name",
+                )?;
+                let rows = stmt.query_map(params![key], map_room_row)?;
+                for row in rows { rooms.push(row?); }
+            }
+            (None, None) => {
+                let mut stmt = conn.prepare(
+                    "SELECT room_id, name, description, parent_id, created_by, created_at, visibility, owner_key
+                     FROM rooms WHERE visibility = 'public' ORDER BY name",
+                )?;
+                let rows = stmt.query_map([], map_room_row)?;
+                for row in rows { rooms.push(row?); }
+            }
+        }
+
+        Ok(rooms)
+    }
+
+    // --- Vote operations (continued) ---
+
     pub fn get_vote_meta(
         &self,
         vote_id: &str,
@@ -421,7 +563,7 @@ impl Store {
 
 fn query_room_by_id(conn: &Connection, room_id: &str) -> Result<Option<Room>, StoreError> {
     let mut stmt = conn.prepare(
-        "SELECT room_id, name, description, parent_id, created_by, created_at FROM rooms WHERE room_id = ?1",
+        "SELECT room_id, name, description, parent_id, created_by, created_at, visibility, owner_key FROM rooms WHERE room_id = ?1",
     )?;
 
     let room = stmt.query_row(params![room_id], map_room_row);
@@ -442,6 +584,8 @@ fn map_room_row(row: &rusqlite::Row) -> rusqlite::Result<Room> {
         ephemeral: false,
         created_at: parse_timestamp(&row.get::<_, String>(5)?),
         created_by: row.get(4)?,
+        visibility: row.get::<_, String>(6).unwrap_or_else(|_| "private".to_string()),
+        owner_key: row.get(7)?,
     })
 }
 

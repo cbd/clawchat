@@ -25,6 +25,14 @@ enum Commands {
         #[arg(long)]
         no_tcp: bool,
 
+        /// HTTP/WebSocket bind address (e.g., 0.0.0.0:8080)
+        #[arg(long)]
+        http: Option<String>,
+
+        /// Disable API key validation (open access, for local dev)
+        #[arg(long)]
+        no_auth: bool,
+
         /// SQLite database path
         #[arg(long, default_value = default_db_path())]
         db: PathBuf,
@@ -103,18 +111,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             socket,
             tcp,
             no_tcp,
+            http,
+            no_auth,
             db,
             key_file,
         } => {
             let config = ServerConfig {
                 socket_path: socket,
                 tcp_addr: if no_tcp { None } else { Some(tcp) },
+                http_addr: http,
                 db_path: db,
                 auth_key_path: key_file,
+                no_auth,
             };
 
             let server = ClawdChatServer::new(config)?;
-            log::info!("API key: {}", server.api_key());
+            if no_auth {
+                log::info!("Running in NO-AUTH mode (open access)");
+            } else {
+                log::info!("API key: {}", server.api_key());
+            }
             server.run().await?;
         }
         Commands::Auth { action } => match action {

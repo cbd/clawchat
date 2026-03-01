@@ -1,0 +1,26 @@
+# Build stage
+FROM rust:1.85-bookworm AS builder
+
+WORKDIR /app
+COPY . .
+
+RUN cargo build --release -p clawdchat-server
+
+# Runtime stage
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/release/clawdchat-server /usr/local/bin/clawdchat-server
+
+# Create data directory
+RUN mkdir -p /data
+
+EXPOSE 8080
+
+CMD ["clawdchat-server", "serve", \
+     "--http", "0.0.0.0:8080", \
+     "--no-tcp", \
+     "--db", "/data/clawdchat.db", \
+     "--key-file", "/data/auth.key", \
+     "--socket", "/tmp/clawdchat.sock"]

@@ -11,14 +11,17 @@ use crate::auth;
 use crate::broker::Broker;
 use crate::connection::AgentConnection;
 use crate::handler;
+use crate::rate_limit::{RateLimiter, TierLimits};
 use crate::store::Store;
 use crate::voting::VoteManager;
 
 pub struct ServerConfig {
     pub socket_path: PathBuf,
     pub tcp_addr: Option<String>,
+    pub http_addr: Option<String>,
     pub db_path: PathBuf,
     pub auth_key_path: PathBuf,
+    pub no_auth: bool,
 }
 
 pub struct ClawdChatServer {
@@ -27,6 +30,7 @@ pub struct ClawdChatServer {
     store: Arc<Store>,
     ephemeral_rooms: Arc<DashMap<String, Room>>,
     vote_mgr: Arc<VoteManager>,
+    rate_limiter: Arc<RateLimiter>,
     api_key: String,
 }
 
@@ -43,6 +47,7 @@ impl ClawdChatServer {
         let broker = Arc::new(Broker::new(agents, room_members));
         let ephemeral_rooms = Arc::new(DashMap::new());
         let vote_mgr = Arc::new(VoteManager::new());
+        let rate_limiter = Arc::new(RateLimiter::new());
         let api_key = auth::load_or_create_key(&config.auth_key_path)?;
 
         log::info!("API key loaded from {:?}", config.auth_key_path);
@@ -54,11 +59,12 @@ impl ClawdChatServer {
             store,
             ephemeral_rooms,
             vote_mgr,
+            rate_limiter,
             api_key,
         })
     }
 
-    /// Start the server, listening on both UDS and TCP (if configured).
+    /// Start the server, listening on UDS, TCP, and/or HTTP (as configured).
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error>> {
         // Clean up stale socket file
         if self.config.socket_path.exists() {
@@ -71,75 +77,115 @@ impl ClawdChatServer {
         let uds_listener = UnixListener::bind(&self.config.socket_path)?;
         log::info!("Listening on UDS: {:?}", self.config.socket_path);
 
-        match &self.config.tcp_addr {
-            Some(addr) => {
-                let tcp_listener = TcpListener::bind(addr).await?;
-                log::info!("Listening on TCP: {}", addr);
-
-                tokio::select! {
-                    result = self.accept_uds_loop(uds_listener) => result,
-                    result = self.accept_tcp_loop(tcp_listener) => result,
-                    _ = tokio::signal::ctrl_c() => {
-                        log::info!("Shutting down...");
-                        Ok(())
+        // Spawn UDS accept loop as a task
+        let uds_broker = self.broker.clone();
+        let uds_store = self.store.clone();
+        let uds_ephemeral = self.ephemeral_rooms.clone();
+        let uds_vote_mgr = self.vote_mgr.clone();
+        let uds_api_key = self.api_key.clone();
+        let uds_no_auth = self.config.no_auth;
+        let uds_rate_limiter = self.rate_limiter.clone();
+        let uds_task = tokio::spawn(async move {
+            loop {
+                match uds_listener.accept().await {
+                    Ok((stream, _addr)) => {
+                        let (read_half, write_half) = tokio::io::split(stream);
+                        let broker = uds_broker.clone();
+                        let store = uds_store.clone();
+                        let ephemeral = uds_ephemeral.clone();
+                        let vote_mgr = uds_vote_mgr.clone();
+                        let api_key = uds_api_key.clone();
+                        let rate_limiter = uds_rate_limiter.clone();
+                        tokio::spawn(async move {
+                            let _ = connection_loop(
+                                read_half, write_half, broker, store, ephemeral,
+                                vote_mgr, api_key, uds_no_auth, rate_limiter,
+                            ).await;
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("UDS accept error: {}", e);
+                        break;
                     }
                 }
-            }
-            None => {
-                tokio::select! {
-                    result = self.accept_uds_loop(uds_listener) => result,
-                    _ = tokio::signal::ctrl_c() => {
-                        log::info!("Shutting down...");
-                        Ok(())
-                    }
-                }
-            }
-        }
-    }
-
-    async fn accept_uds_loop(
-        &self,
-        listener: UnixListener,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        loop {
-            let (stream, _addr) = listener.accept().await?;
-            let (read_half, write_half) = tokio::io::split(stream);
-            self.handle_connection(read_half, write_half).await;
-        }
-    }
-
-    async fn accept_tcp_loop(
-        &self,
-        listener: TcpListener,
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        loop {
-            let (stream, addr) = listener.accept().await?;
-            log::info!("TCP connection from {}", addr);
-            let (read_half, write_half) = tokio::io::split(stream);
-            self.handle_connection(read_half, write_half).await;
-        }
-    }
-
-    /// Handle a new connection: wait for registration, then process frames.
-    async fn handle_connection<R, W>(&self, read_half: R, write_half: W)
-    where
-        R: tokio::io::AsyncRead + Unpin + Send + 'static,
-        W: tokio::io::AsyncWrite + Unpin + Send + 'static,
-    {
-        let broker = self.broker.clone();
-        let store = self.store.clone();
-        let ephemeral_rooms = self.ephemeral_rooms.clone();
-        let vote_mgr = self.vote_mgr.clone();
-        let api_key = self.api_key.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) =
-                connection_loop(read_half, write_half, broker, store, ephemeral_rooms, vote_mgr, api_key)
-                    .await
-            {
-                log::error!("Connection error: {}", e);
             }
         });
+
+        // Spawn TCP accept loop if configured
+        let tcp_task = if let Some(addr) = &self.config.tcp_addr {
+            let tcp_listener = TcpListener::bind(addr).await?;
+            log::info!("Listening on TCP: {}", addr);
+            let tcp_broker = self.broker.clone();
+            let tcp_store = self.store.clone();
+            let tcp_ephemeral = self.ephemeral_rooms.clone();
+            let tcp_vote_mgr = self.vote_mgr.clone();
+            let tcp_api_key = self.api_key.clone();
+            let tcp_no_auth = self.config.no_auth;
+            let tcp_rate_limiter = self.rate_limiter.clone();
+            Some(tokio::spawn(async move {
+                loop {
+                    match tcp_listener.accept().await {
+                        Ok((stream, addr)) => {
+                            log::info!("TCP connection from {}", addr);
+                            let (read_half, write_half) = tokio::io::split(stream);
+                            let broker = tcp_broker.clone();
+                            let store = tcp_store.clone();
+                            let ephemeral = tcp_ephemeral.clone();
+                            let vote_mgr = tcp_vote_mgr.clone();
+                            let api_key = tcp_api_key.clone();
+                            let rate_limiter = tcp_rate_limiter.clone();
+                            tokio::spawn(async move {
+                                let _ = connection_loop(
+                                    read_half, write_half, broker, store, ephemeral,
+                                    vote_mgr, api_key, tcp_no_auth, rate_limiter,
+                                ).await;
+                            });
+                        }
+                        Err(e) => {
+                            log::error!("TCP accept error: {}", e);
+                            break;
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Spawn HTTP/WebSocket listener if configured
+        let http_task = if let Some(addr) = &self.config.http_addr {
+            let app_state = crate::web::AppState {
+                broker: self.broker.clone(),
+                store: self.store.clone(),
+                ephemeral_rooms: self.ephemeral_rooms.clone(),
+                vote_mgr: self.vote_mgr.clone(),
+                rate_limiter: self.rate_limiter.clone(),
+                no_auth: self.config.no_auth,
+                api_key: self.api_key.clone(),
+            };
+            let router = crate::web::router(app_state);
+            let listener = tokio::net::TcpListener::bind(addr).await?;
+            log::info!("HTTP/WebSocket listening on {}", addr);
+            Some(tokio::spawn(async move {
+                if let Err(e) = axum::serve(listener, router).await {
+                    log::error!("HTTP server error: {}", e);
+                }
+            }))
+        } else {
+            None
+        };
+
+        // Wait for shutdown signal
+        tokio::select! {
+            _ = uds_task => {},
+            _ = async { if let Some(t) = tcp_task { t.await.ok(); } else { std::future::pending::<()>().await } } => {},
+            _ = async { if let Some(t) = http_task { t.await.ok(); } else { std::future::pending::<()>().await } } => {},
+            _ = tokio::signal::ctrl_c() => {
+                log::info!("Shutting down...");
+            }
+        }
+
+        Ok(())
     }
 
     pub fn api_key(&self) -> &str {
@@ -148,6 +194,18 @@ impl ClawdChatServer {
 
     pub fn socket_path(&self) -> &Path {
         &self.config.socket_path
+    }
+
+    pub fn store(&self) -> &Arc<Store> {
+        &self.store
+    }
+
+    pub fn broker(&self) -> &Arc<Broker> {
+        &self.broker
+    }
+
+    pub fn rate_limiter(&self) -> &Arc<RateLimiter> {
+        &self.rate_limiter
     }
 }
 
@@ -159,7 +217,7 @@ impl Drop for ClawdChatServer {
 }
 
 /// Main per-connection loop. Handles registration then dispatches frames.
-async fn connection_loop<R, W>(
+pub async fn connection_loop<R, W>(
     read_half: R,
     mut write_half: W,
     broker: Arc<Broker>,
@@ -167,6 +225,8 @@ async fn connection_loop<R, W>(
     ephemeral_rooms: Arc<DashMap<String, Room>>,
     vote_mgr: Arc<VoteManager>,
     api_key: String,
+    no_auth: bool,
+    rate_limiter: Arc<RateLimiter>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -176,7 +236,7 @@ where
     let mut line = String::new();
 
     // Phase 1: Wait for register command
-    let (agent_id, agent_name, agent_capabilities, session_id) = loop {
+    let (agent_id, agent_name, agent_capabilities, session_id, agent_api_key) = loop {
         line.clear();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
@@ -223,13 +283,38 @@ where
         };
 
         // Validate API key
-        if payload.key != api_key {
-            let err = Frame::error(
-                frame.id.as_deref(),
-                ErrorPayload::new(ErrorCode::Unauthorized, "Invalid API key"),
-            );
-            write_half.write_all(err.to_line()?.as_bytes()).await?;
-            return Ok(()); // Close connection on auth failure
+        let authenticated_key = if no_auth {
+            // No auth mode: accept any key (or empty)
+            payload.key.clone()
+        } else {
+            // Check against file-based key first
+            if payload.key == api_key {
+                payload.key.clone()
+            } else if store.validate_api_key(&payload.key).unwrap_or(false) {
+                // Check against api_keys table
+                payload.key.clone()
+            } else {
+                let err = Frame::error(
+                    frame.id.as_deref(),
+                    ErrorPayload::new(ErrorCode::Unauthorized, "Invalid API key"),
+                );
+                write_half.write_all(err.to_line()?.as_bytes()).await?;
+                return Ok(()); // Close connection on auth failure
+            }
+        };
+
+        // Check rate limit for agent count (skip in no_auth mode)
+        if !no_auth && !authenticated_key.is_empty() {
+            let tier = store.get_key_tier(&authenticated_key).unwrap_or_else(|_| "free".to_string());
+            let limits = TierLimits::for_tier(&tier);
+            if rate_limiter.check_agent_limit(&authenticated_key, &limits).is_err() {
+                let err = Frame::error(
+                    frame.id.as_deref(),
+                    ErrorPayload::new(ErrorCode::RateLimitAgents, "Agent limit exceeded for this API key"),
+                );
+                write_half.write_all(err.to_line()?.as_bytes()).await?;
+                return Ok(());
+            }
         }
 
         let agent_id = payload
@@ -256,6 +341,11 @@ where
         );
         write_half.write_all(ok.to_line()?.as_bytes()).await?;
 
+        // Track agent in rate limiter
+        if !authenticated_key.is_empty() {
+            rate_limiter.add_agent(&authenticated_key);
+        }
+
         log::info!(
             "Agent registered: {} ({}) capabilities={:?}",
             payload.name,
@@ -272,7 +362,7 @@ where
             &payload.capabilities,
         );
 
-        break (agent_id, payload.name, payload.capabilities, session_id);
+        break (agent_id, payload.name, payload.capabilities, session_id, authenticated_key);
     };
 
     // Phase 2: Set up channel + task pair (the chat-notifier pattern)
@@ -309,6 +399,7 @@ where
         send_task,
         // Placeholder task that immediately completes
         tokio::spawn(async {}),
+        agent_api_key.clone(),
     );
     broker.agents.insert(agent_id.clone(), conn);
 
@@ -343,14 +434,29 @@ where
             }
         };
 
-        let response =
-            handler::handle_frame(frame, &agent_id, &agent_name, &broker, &store, &ephemeral_rooms, &vote_mgr)
-                .await;
+        let response = handler::handle_frame(
+            frame,
+            &agent_id,
+            &agent_name,
+            &broker,
+            &store,
+            &ephemeral_rooms,
+            &vote_mgr,
+            &agent_api_key,
+            &rate_limiter,
+            no_auth,
+        )
+        .await;
         let _ = tx.send(response);
     }
 
     // Phase 4: Cleanup on disconnect
     log::info!("Agent disconnected: {} ({})", agent_name, agent_id);
+
+    // Remove from rate limiter
+    if !agent_api_key.is_empty() {
+        rate_limiter.remove_agent(&agent_api_key);
+    }
 
     // Leave all rooms and clean up ephemeral rooms
     let left_rooms = broker.leave_all_rooms(&agent_id);

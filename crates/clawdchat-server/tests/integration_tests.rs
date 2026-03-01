@@ -20,8 +20,10 @@ async fn start_test_server() -> (tokio::task::JoinHandle<()>, String, String, te
     let config = ServerConfig {
         socket_path,
         tcp_addr: Some(tcp_addr.clone()),
+        http_addr: None,
         db_path,
         auth_key_path: key_path,
+        no_auth: false,
     };
 
     let server = ClawdChatServer::new(config).unwrap();

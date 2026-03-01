@@ -23,6 +23,16 @@ pub struct Room {
     pub created_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    /// Room visibility: "public" or "private". Private rooms are only visible to the owning key.
+    #[serde(default = "default_visibility")]
+    pub visibility: String,
+    /// API key that owns this room (None for system rooms like lobby).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_key: Option<String>,
+}
+
+fn default_visibility() -> String {
+    "private".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +70,9 @@ pub struct CreateRoomPayload {
     pub parent_id: Option<String>,
     #[serde(default)]
     pub ephemeral: bool,
+    /// If true, room is public (any API key can join). Default: private.
+    #[serde(default)]
+    pub public: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

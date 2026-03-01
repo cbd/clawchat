@@ -34,4 +34,8 @@ pub enum ErrorCode {
     NotLeader,
     ElectionInProgress,
     NoElectionActive,
+    RateLimitAgents,
+    RateLimitMessages,
+    RateLimitRooms,
+    AccessDenied,
 }

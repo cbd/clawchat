@@ -2,6 +2,7 @@ use clawdchat_core::*;
 use std::sync::Arc;
 
 use crate::broker::Broker;
+use crate::rate_limit::{RateLimiter, TierLimits};
 use crate::store::Store;
 use crate::voting::VoteManager;
 
@@ -15,18 +16,21 @@ pub async fn handle_frame(
     store: &Arc<Store>,
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
     vote_mgr: &Arc<VoteManager>,
+    agent_api_key: &str,
+    rate_limiter: &Arc<RateLimiter>,
+    no_auth: bool,
 ) -> Frame {
     let req_id = frame.id.as_deref();
 
     match frame.frame_type {
         FrameType::Ping => Frame::pong(req_id),
 
-        FrameType::CreateRoom => handle_create_room(req_id, frame.payload, agent_id, broker, store, ephemeral_rooms).await,
-        FrameType::JoinRoom => handle_join_room(req_id, frame.payload, agent_id, agent_name, broker, store, ephemeral_rooms).await,
+        FrameType::CreateRoom => handle_create_room(req_id, frame.payload, agent_id, broker, store, ephemeral_rooms, agent_api_key, rate_limiter, no_auth).await,
+        FrameType::JoinRoom => handle_join_room(req_id, frame.payload, agent_id, agent_name, broker, store, ephemeral_rooms, agent_api_key, no_auth).await,
         FrameType::LeaveRoom => handle_leave_room(req_id, frame.payload, agent_id, broker, ephemeral_rooms).await,
-        FrameType::SendMessage => handle_send_message(req_id, frame.payload, agent_id, agent_name, broker, store, ephemeral_rooms).await,
+        FrameType::SendMessage => handle_send_message(req_id, frame.payload, agent_id, agent_name, broker, store, ephemeral_rooms, agent_api_key, rate_limiter, no_auth).await,
         FrameType::GetHistory => handle_get_history(req_id, frame.payload, store).await,
-        FrameType::ListRooms => handle_list_rooms(req_id, frame.payload, store, ephemeral_rooms).await,
+        FrameType::ListRooms => handle_list_rooms(req_id, frame.payload, store, ephemeral_rooms, agent_api_key, no_auth).await,
         FrameType::ListAgents => handle_list_agents(req_id, frame.payload, broker).await,
         FrameType::RoomInfo => handle_room_info(req_id, frame.payload, store, broker, ephemeral_rooms).await,
 
@@ -54,6 +58,9 @@ async fn handle_create_room(
     broker: &Arc<Broker>,
     store: &Arc<Store>,
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    rate_limiter: &Arc<RateLimiter>,
+    no_auth: bool,
 ) -> Frame {
     let p: CreateRoomPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -65,7 +72,20 @@ async fn handle_create_room(
         }
     };
 
+    // Check room limit (skip in no_auth mode)
+    if !no_auth && !agent_api_key.is_empty() {
+        let tier = store.get_key_tier(agent_api_key).unwrap_or_else(|_| "free".to_string());
+        let limits = TierLimits::for_tier(&tier);
+        if rate_limiter.check_room_limit(agent_api_key, &limits).is_err() {
+            return Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::RateLimitRooms, "Room limit exceeded for this API key"),
+            );
+        }
+    }
+
     let room_id = uuid::Uuid::new_v4().to_string();
+    let visibility = if p.public { "public" } else { "private" };
 
     if p.ephemeral {
         let room = Room {
@@ -76,8 +96,15 @@ async fn handle_create_room(
             ephemeral: true,
             created_at: chrono::Utc::now(),
             created_by: Some(agent_id.to_string()),
+            visibility: visibility.to_string(),
+            owner_key: if agent_api_key.is_empty() { None } else { Some(agent_api_key.to_string()) },
         };
         ephemeral_rooms.insert(room_id.clone(), room.clone());
+
+        // Track in rate limiter
+        if !agent_api_key.is_empty() {
+            rate_limiter.add_room(agent_api_key);
+        }
 
         // Broadcast room creation to all connected agents
         let event = Frame::event(FrameType::RoomCreated, serde_json::to_value(&room).unwrap());
@@ -99,8 +126,18 @@ async fn handle_create_room(
             }
         }
 
-        match store.create_room(&room_id, &p.name, p.description.as_deref(), p.parent_id.as_deref(), Some(agent_id)) {
+        let owner_key = if agent_api_key.is_empty() { None } else { Some(agent_api_key) };
+
+        match store.create_room_with_visibility(
+            &room_id, &p.name, p.description.as_deref(), p.parent_id.as_deref(),
+            Some(agent_id), visibility, owner_key,
+        ) {
             Ok(room) => {
+                // Track in rate limiter
+                if !agent_api_key.is_empty() {
+                    rate_limiter.add_room(agent_api_key);
+                }
+
                 let event = Frame::event(FrameType::RoomCreated, serde_json::to_value(&room).unwrap());
                 for entry in broker.agents.iter() {
                     broker.send_to_agent(entry.key(), event.clone());
@@ -127,6 +164,8 @@ async fn handle_join_room(
     broker: &Arc<Broker>,
     store: &Arc<Store>,
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    no_auth: bool,
 ) -> Frame {
     let p: JoinRoomPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -138,14 +177,36 @@ async fn handle_join_room(
         }
     };
 
-    // Check room exists
-    let room_exists = store.get_room(&p.room_id).ok().flatten().is_some()
-        || ephemeral_rooms.contains_key(&p.room_id);
+    // Check room exists and get visibility info
+    let (room_exists, room_visibility, room_owner_key) = {
+        if let Some(room) = ephemeral_rooms.get(&p.room_id) {
+            (true, room.visibility.clone(), room.owner_key.clone())
+        } else if let Ok(Some(room)) = store.get_room(&p.room_id) {
+            (true, room.visibility.clone(), room.owner_key.clone())
+        } else {
+            (false, String::new(), None)
+        }
+    };
+
     if !room_exists {
         return Frame::error(
             req_id,
             ErrorPayload::new(ErrorCode::RoomNotFound, "Room not found"),
         );
+    }
+
+    // Check visibility: private rooms require matching API key
+    if !no_auth && room_visibility == "private" {
+        let can_access = match &room_owner_key {
+            Some(owner) => owner == agent_api_key,
+            None => true, // System rooms (no owner) are accessible to all
+        };
+        if !can_access {
+            return Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::AccessDenied, "This room is private"),
+            );
+        }
     }
 
     if broker.is_agent_in_room(agent_id, &p.room_id) {
@@ -245,6 +306,9 @@ async fn handle_send_message(
     broker: &Arc<Broker>,
     store: &Arc<Store>,
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    rate_limiter: &Arc<RateLimiter>,
+    no_auth: bool,
 ) -> Frame {
     let p: SendMessagePayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -261,6 +325,18 @@ async fn handle_send_message(
             req_id,
             ErrorPayload::new(ErrorCode::NotInRoom, "Not in this room"),
         );
+    }
+
+    // Check message rate limit (skip in no_auth mode)
+    if !no_auth && !agent_api_key.is_empty() {
+        let tier = store.get_key_tier(agent_api_key).unwrap_or_else(|_| "free".to_string());
+        let limits = TierLimits::for_tier(&tier);
+        if rate_limiter.check_message_rate(agent_api_key, &limits).is_err() {
+            return Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::RateLimitMessages, "Message rate limit exceeded"),
+            );
+        }
     }
 
     let message_id = uuid::Uuid::new_v4().to_string();
@@ -298,6 +374,11 @@ async fn handle_send_message(
             }
         }
     };
+
+    // Track in rate limiter
+    if !agent_api_key.is_empty() {
+        rate_limiter.increment_message(agent_api_key);
+    }
 
     // Broadcast to room members (excluding sender)
     let event = Frame::event(
@@ -351,30 +432,57 @@ async fn handle_list_rooms(
     payload: serde_json::Value,
     store: &Arc<Store>,
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    no_auth: bool,
 ) -> Frame {
     let p: ListRoomsPayload = serde_json::from_value(payload).unwrap_or(ListRoomsPayload {
         parent_id: None,
     });
 
-    let mut rooms = match store.list_rooms(p.parent_id.as_deref()) {
-        Ok(r) => r,
-        Err(e) => {
-            return Frame::error(
-                req_id,
-                ErrorPayload::new(ErrorCode::InternalError, e.to_string()),
-            )
+    // In no_auth mode, show all rooms. In cloud mode, show public + owned by this key.
+    let mut rooms = if no_auth {
+        match store.list_rooms(p.parent_id.as_deref()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Frame::error(
+                    req_id,
+                    ErrorPayload::new(ErrorCode::InternalError, e.to_string()),
+                )
+            }
+        }
+    } else {
+        let key = if agent_api_key.is_empty() { None } else { Some(agent_api_key) };
+        match store.list_rooms_for_key(key, p.parent_id.as_deref()) {
+            Ok(r) => r,
+            Err(e) => {
+                return Frame::error(
+                    req_id,
+                    ErrorPayload::new(ErrorCode::InternalError, e.to_string()),
+                )
+            }
         }
     };
 
-    // Include ephemeral rooms
+    // Include ephemeral rooms (with visibility filtering in cloud mode)
     for entry in ephemeral_rooms.iter() {
         let room = entry.value();
-        let matches = match &p.parent_id {
+        let matches_parent = match &p.parent_id {
             Some(pid) => room.parent_id.as_deref() == Some(pid.as_str()),
             None => true,
         };
-        if matches {
+        if !matches_parent {
+            continue;
+        }
+
+        if no_auth {
             rooms.push(room.clone());
+        } else {
+            // In cloud mode, only show public ephemeral rooms or rooms owned by this key
+            let visible = room.visibility == "public"
+                || room.owner_key.as_deref() == Some(agent_api_key);
+            if visible {
+                rooms.push(room.clone());
+            }
         }
     }
 

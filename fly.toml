@@ -1,0 +1,28 @@
+app = 'clawdchat'
+primary_region = 'sjc'
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+[mounts]
+  source = 'clawdchat_data'
+  destination = '/data'
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '256mb'
+
+[checks]
+  [checks.status]
+    type = 'http'
+    port = 8080
+    path = '/api/status'
+    interval = '15s'
+    timeout = '5s'

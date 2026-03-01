@@ -11,6 +11,8 @@ pub struct AgentConnection {
     pub send_task: JoinHandle<()>,
     pub receive_task: JoinHandle<()>,
     pub rooms: HashSet<String>,
+    /// The API key this agent authenticated with (for room visibility checks).
+    pub api_key: String,
 }
 
 impl AgentConnection {
@@ -20,6 +22,7 @@ impl AgentConnection {
         sender: mpsc::UnboundedSender<Frame>,
         send_task: JoinHandle<()>,
         receive_task: JoinHandle<()>,
+        api_key: String,
     ) -> Self {
         Self {
             info,
@@ -28,6 +31,7 @@ impl AgentConnection {
             send_task,
             receive_task,
             rooms: HashSet::new(),
+            api_key,
         }
     }
 }
