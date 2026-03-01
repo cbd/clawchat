@@ -196,10 +196,18 @@ class Agent:
         })["payload"]
 
     def get_vote_status(self, vote_id: str) -> dict:
-        """Check vote status (does not reveal ballots)."""
+        """Check vote status. Closed votes include revealed tally."""
         return self._request("get_vote_status", {
             "vote_id": vote_id,
         })["payload"]
+
+    def list_votes(self, room_id: str, limit: int = 20) -> list[dict]:
+        """List recent votes for a room (open and closed)."""
+        resp = self._request("list_votes", {
+            "room_id": room_id,
+            "limit": limit,
+        })
+        return resp["payload"].get("votes", [])
 
     # -- Elections --
 

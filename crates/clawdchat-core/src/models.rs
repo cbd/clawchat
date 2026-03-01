@@ -140,6 +140,17 @@ pub struct GetVoteStatusPayload {
     pub vote_id: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ListVotesPayload {
+    pub room_id: String,
+    #[serde(default = "default_vote_limit")]
+    pub limit: u32,
+}
+
+fn default_vote_limit() -> u32 {
+    20
+}
+
 /// Summary of a vote (returned on creation and status queries).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VoteInfo {
@@ -156,8 +167,11 @@ pub struct VoteInfo {
     pub status: VoteStatus,
     /// Number of ballots cast (not WHO voted or WHAT they voted).
     pub votes_cast: usize,
-    /// Total eligible voters (room members at time of query).
+    /// Total eligible voters (room members at vote creation time).
     pub eligible_voters: usize,
+    /// Revealed tally for closed votes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tally: Option<Vec<VoteTally>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

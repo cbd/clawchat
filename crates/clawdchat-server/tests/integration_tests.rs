@@ -1,11 +1,16 @@
 use clawdchat_client::ClawdChatClient;
-use clawdchat_core::{Frame, FrameType, RegisterPayload};
+use clawdchat_core::{Frame, FrameType, RegisterPayload, VoteStatus};
 use clawdchat_server::{ClawdChatServer, ServerConfig};
 use std::time::Duration;
 use tokio::time::sleep;
 
 /// Start a test server on a random TCP port.
-async fn start_test_server() -> (tokio::task::JoinHandle<()>, String, String, tempfile::TempDir) {
+async fn start_test_server() -> (
+    tokio::task::JoinHandle<()>,
+    String,
+    String,
+    tempfile::TempDir,
+) {
     let tmp_dir = tempfile::TempDir::new().unwrap();
     let db_path = tmp_dir.path().join("test.db");
     let key_path = tmp_dir.path().join("auth.key");
@@ -125,7 +130,10 @@ async fn test_read_error_disconnect_removes_agent() {
         sleep(Duration::from_millis(100)).await;
     }
 
-    assert!(!found_stale, "abruptly disconnected agent should be removed");
+    assert!(
+        !found_stale,
+        "abruptly disconnected agent should be removed"
+    );
 }
 
 #[tokio::test]
@@ -207,7 +215,13 @@ async fn test_two_agents_communicate() {
         .unwrap();
     assert_eq!(event.frame.frame_type, FrameType::MessageReceived);
     assert_eq!(
-        event.frame.payload.get("content").unwrap().as_str().unwrap(),
+        event
+            .frame
+            .payload
+            .get("content")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "Hello from A!"
     );
 }
@@ -219,9 +233,18 @@ async fn test_message_history() {
     let client = connect_agent(&addr, &key, "agent-a").await;
     client.join_room("lobby").await.unwrap();
 
-    client.send_message("lobby", "msg 1", None, vec![]).await.unwrap();
-    client.send_message("lobby", "msg 2", None, vec![]).await.unwrap();
-    client.send_message("lobby", "msg 3", None, vec![]).await.unwrap();
+    client
+        .send_message("lobby", "msg 1", None, vec![])
+        .await
+        .unwrap();
+    client
+        .send_message("lobby", "msg 2", None, vec![])
+        .await
+        .unwrap();
+    client
+        .send_message("lobby", "msg 3", None, vec![])
+        .await
+        .unwrap();
 
     let history = client.get_history("lobby", 50, None).await.unwrap();
     assert_eq!(history.len(), 3);
@@ -246,7 +269,10 @@ async fn test_ephemeral_room_lifecycle() {
     agent_a.join_room(&room_id).await.unwrap();
     agent_b.join_room(&room_id).await.unwrap();
 
-    agent_a.send_message(&room_id, "ephemeral msg", None, vec![]).await.unwrap();
+    agent_a
+        .send_message(&room_id, "ephemeral msg", None, vec![])
+        .await
+        .unwrap();
 
     agent_a.leave_room(&room_id).await.unwrap();
     agent_b.leave_room(&room_id).await.unwrap();
@@ -267,7 +293,12 @@ async fn test_room_hierarchy() {
         .unwrap();
 
     let child = client
-        .create_room("alpha-testing", Some("Testing"), Some(&parent.room_id), false)
+        .create_room(
+            "alpha-testing",
+            Some("Testing"),
+            Some(&parent.room_id),
+            false,
+        )
         .await
         .unwrap();
     assert_eq!(child.parent_id, Some(parent.room_id.clone()));
@@ -305,13 +336,21 @@ async fn test_mention_cross_room() {
 
     agent_a.join_room("lobby").await.unwrap();
 
-    let room = agent_b.create_room("other-room", None, None, false).await.unwrap();
+    let room = agent_b
+        .create_room("other-room", None, None, false)
+        .await
+        .unwrap();
     agent_b.join_room(&room.room_id).await.unwrap();
 
     let mut events_b = agent_b.subscribe();
 
     agent_a
-        .send_message("lobby", "Hey @agent-b check this", None, vec![agent_b.agent_id.clone()])
+        .send_message(
+            "lobby",
+            "Hey @agent-b check this",
+            None,
+            vec![agent_b.agent_id.clone()],
+        )
         .await
         .unwrap();
 
@@ -382,7 +421,13 @@ async fn test_sealed_vote_two_agents() {
     };
 
     // Verify results are revealed
-    let tally = result_event.frame.payload.get("tally").unwrap().as_array().unwrap();
+    let tally = result_event
+        .frame
+        .payload
+        .get("tally")
+        .unwrap()
+        .as_array()
+        .unwrap();
     assert_eq!(tally.len(), 2);
     // Option 0 got 1 vote, option 1 got 1 vote
     let count_0 = tally[0].get("count").unwrap().as_u64().unwrap();
@@ -391,8 +436,124 @@ async fn test_sealed_vote_two_agents() {
     assert_eq!(count_1, 1);
 
     // Ballots should be revealed
-    let ballots = result_event.frame.payload.get("ballots").unwrap().as_array().unwrap();
+    let ballots = result_event
+        .frame
+        .payload
+        .get("ballots")
+        .unwrap()
+        .as_array()
+        .unwrap();
     assert_eq!(ballots.len(), 2);
+}
+
+#[tokio::test]
+async fn test_get_vote_status_after_close_returns_tally() {
+    let (_handle, addr, key, _tmp) = start_test_server().await;
+
+    let agent_a = connect_agent(&addr, &key, "agent-a").await;
+    let agent_b = connect_agent(&addr, &key, "agent-b").await;
+
+    agent_a.join_room("lobby").await.unwrap();
+    agent_b.join_room("lobby").await.unwrap();
+
+    let mut events_a = agent_a.subscribe();
+
+    let vote_info = agent_a
+        .create_vote(
+            "lobby",
+            "Status after close",
+            None,
+            vec!["A".to_string(), "B".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    agent_a.cast_vote(&vote_info.vote_id, 0).await.unwrap();
+    agent_b.cast_vote(&vote_info.vote_id, 1).await.unwrap();
+
+    // Wait for vote closure event.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(event) = events_a.recv().await {
+                if event.frame.frame_type == FrameType::VoteResult {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("VoteResult should arrive");
+
+    let status = agent_a.get_vote_status(&vote_info.vote_id).await.unwrap();
+    assert_eq!(status.status, VoteStatus::Closed);
+    assert_eq!(status.votes_cast, 2);
+    assert_eq!(status.eligible_voters, 2);
+
+    let tally = status
+        .tally
+        .expect("closed vote status should include tally");
+    assert_eq!(tally.len(), 2);
+    let count_a = tally
+        .iter()
+        .find(|row| row.option_index == 0)
+        .map(|row| row.count)
+        .unwrap_or(0);
+    let count_b = tally
+        .iter()
+        .find(|row| row.option_index == 1)
+        .map(|row| row.count)
+        .unwrap_or(0);
+    assert_eq!(count_a, 1);
+    assert_eq!(count_b, 1);
+}
+
+#[tokio::test]
+async fn test_list_votes_includes_closed_vote_history() {
+    let (_handle, addr, key, _tmp) = start_test_server().await;
+
+    let agent_a = connect_agent(&addr, &key, "agent-a").await;
+    let agent_b = connect_agent(&addr, &key, "agent-b").await;
+
+    agent_a.join_room("lobby").await.unwrap();
+    agent_b.join_room("lobby").await.unwrap();
+
+    let mut events_a = agent_a.subscribe();
+
+    let vote_info = agent_a
+        .create_vote(
+            "lobby",
+            "History vote",
+            None,
+            vec!["Yes".to_string(), "No".to_string()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    agent_a.cast_vote(&vote_info.vote_id, 0).await.unwrap();
+    agent_b.cast_vote(&vote_info.vote_id, 0).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(event) = events_a.recv().await {
+                if event.frame.frame_type == FrameType::VoteResult {
+                    break;
+                }
+            }
+        }
+    })
+    .await
+    .expect("VoteResult should arrive");
+
+    let votes = agent_a.list_votes("lobby", 10).await.unwrap();
+    let found = votes
+        .iter()
+        .find(|v| v.vote_id == vote_info.vote_id)
+        .expect("closed vote should appear in history");
+
+    assert_eq!(found.status, VoteStatus::Closed);
+    assert!(found.tally.is_some());
 }
 
 #[tokio::test]
@@ -437,7 +598,13 @@ async fn test_vote_deadline_expiry() {
     .expect("VoteResult should arrive after deadline");
 
     // Should show 1 vote total (agent A voted, agent B didn't)
-    let total = result_event.frame.payload.get("total_votes").unwrap().as_u64().unwrap();
+    let total = result_event
+        .frame
+        .payload
+        .get("total_votes")
+        .unwrap()
+        .as_u64()
+        .unwrap();
     assert_eq!(total, 1);
 }
 
@@ -544,7 +711,10 @@ async fn test_leader_decision() {
     let agent_a = connect_agent(&addr, &key, "agent-a").await;
 
     // Create a room and be the only member
-    let room = agent_a.create_room("decision-room", None, None, false).await.unwrap();
+    let room = agent_a
+        .create_room("decision-room", None, None, false)
+        .await
+        .unwrap();
     agent_a.join_room(&room.room_id).await.unwrap();
 
     let mut events_a = agent_a.subscribe();
@@ -567,7 +737,11 @@ async fn test_leader_decision() {
 
     // Issue a decision
     let resp = agent_a
-        .send_decision(&room.room_id, "We'll go with Approach A", serde_json::json!({}))
+        .send_decision(
+            &room.room_id,
+            "We'll go with Approach A",
+            serde_json::json!({}),
+        )
         .await
         .unwrap();
     assert!(resp.get("message_id").is_some());
@@ -586,7 +760,13 @@ async fn test_leader_decision() {
     .expect("DecisionMade should be broadcast");
 
     assert_eq!(
-        decision_event.frame.payload.get("content").unwrap().as_str().unwrap(),
+        decision_event
+            .frame
+            .payload
+            .get("content")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "We'll go with Approach A"
     );
 }
@@ -688,17 +868,32 @@ async fn test_three_agent_task_coordination() {
 
     // --- Step 2: Discussion ---
     architect
-        .send_message(&room_id, "We need to pick an API style for the new service. Options are REST, GraphQL, or gRPC.", None, vec![])
+        .send_message(
+            &room_id,
+            "We need to pick an API style for the new service. Options are REST, GraphQL, or gRPC.",
+            None,
+            vec![],
+        )
         .await
         .unwrap();
 
     backend
-        .send_message(&room_id, "I prefer gRPC for inter-service communication - better performance and type safety.", None, vec![])
+        .send_message(
+            &room_id,
+            "I prefer gRPC for inter-service communication - better performance and type safety.",
+            None,
+            vec![],
+        )
         .await
         .unwrap();
 
     frontend
-        .send_message(&room_id, "REST is more practical - easier to debug, better tooling, broader ecosystem.", None, vec![])
+        .send_message(
+            &room_id,
+            "REST is more practical - easier to debug, better tooling, broader ecosystem.",
+            None,
+            vec![],
+        )
         .await
         .unwrap();
 
@@ -708,7 +903,11 @@ async fn test_three_agent_task_coordination() {
             &room_id,
             "API style for the new service",
             Some("Choose the API paradigm for the user-facing service"),
-            vec!["REST".to_string(), "GraphQL".to_string(), "gRPC".to_string()],
+            vec![
+                "REST".to_string(),
+                "GraphQL".to_string(),
+                "gRPC".to_string(),
+            ],
             None, // No deadline -- closes when all 3 vote
         )
         .await
@@ -729,7 +928,13 @@ async fn test_three_agent_task_coordination() {
     .await
     .expect("backend should receive VoteCreated");
     assert_eq!(
-        vote_event.frame.payload.get("title").unwrap().as_str().unwrap(),
+        vote_event
+            .frame
+            .payload
+            .get("title")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "API style for the new service"
     );
 
@@ -763,18 +968,39 @@ async fn test_three_agent_task_coordination() {
     .await
     .expect("architect should receive VoteResult");
 
-    let tally = result_event.frame.payload.get("tally").unwrap().as_array().unwrap();
+    let tally = result_event
+        .frame
+        .payload
+        .get("tally")
+        .unwrap()
+        .as_array()
+        .unwrap();
     assert_eq!(tally.len(), 3);
     // REST=2, GraphQL=0, gRPC=1
-    assert_eq!(tally[0].get("option_text").unwrap().as_str().unwrap(), "REST");
+    assert_eq!(
+        tally[0].get("option_text").unwrap().as_str().unwrap(),
+        "REST"
+    );
     assert_eq!(tally[0].get("count").unwrap().as_u64().unwrap(), 2);
-    assert_eq!(tally[1].get("option_text").unwrap().as_str().unwrap(), "GraphQL");
+    assert_eq!(
+        tally[1].get("option_text").unwrap().as_str().unwrap(),
+        "GraphQL"
+    );
     assert_eq!(tally[1].get("count").unwrap().as_u64().unwrap(), 0);
-    assert_eq!(tally[2].get("option_text").unwrap().as_str().unwrap(), "gRPC");
+    assert_eq!(
+        tally[2].get("option_text").unwrap().as_str().unwrap(),
+        "gRPC"
+    );
     assert_eq!(tally[2].get("count").unwrap().as_u64().unwrap(), 1);
 
     // All ballots revealed
-    let ballots = result_event.frame.payload.get("ballots").unwrap().as_array().unwrap();
+    let ballots = result_event
+        .frame
+        .payload
+        .get("ballots")
+        .unwrap()
+        .as_array()
+        .unwrap();
     assert_eq!(ballots.len(), 3);
 
     // --- Step 6: Leader election ---
@@ -881,21 +1107,40 @@ async fn test_three_agent_task_coordination() {
     .expect("backend should receive DecisionMade");
 
     assert_eq!(
-        decision_event.frame.payload.get("content").unwrap().as_str().unwrap(),
+        decision_event
+            .frame
+            .payload
+            .get("content")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "We'll use REST with OpenAPI spec. The vote was clear: 2-1 in favor of REST."
     );
     assert_eq!(
-        decision_event.frame.payload.get("leader_name").unwrap().as_str().unwrap(),
+        decision_event
+            .frame
+            .payload
+            .get("leader_name")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         leader_name
     );
 
     // --- Step 9: Verify history has the full discussion + decision ---
     let history = architect.get_history(&room_id, 50, None).await.unwrap();
     // Should have: 3 discussion messages + 1 decision message = 4
-    assert!(history.len() >= 4, "expected at least 4 messages in history, got {}", history.len());
+    assert!(
+        history.len() >= 4,
+        "expected at least 4 messages in history, got {}",
+        history.len()
+    );
 
     // First 3 are discussion
-    assert_eq!(history[0].content, "We need to pick an API style for the new service. Options are REST, GraphQL, or gRPC.");
+    assert_eq!(
+        history[0].content,
+        "We need to pick an API style for the new service. Options are REST, GraphQL, or gRPC."
+    );
     assert_eq!(history[0].agent_name, "architect");
     assert_eq!(history[1].agent_name, "backend-dev");
     assert_eq!(history[2].agent_name, "frontend-dev");

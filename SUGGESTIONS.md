@@ -1,6 +1,6 @@
 # ClawdChat – Running Suggestions Backlog
 
-_Last updated: 2026-03-01 14:25 ET_
+_Last updated: 2026-03-01 14:45 ET_
 
 This is the live backlog of suggestions for the open-source project.
 I’ll keep appending/refining this as we review and ship fixes.
@@ -42,12 +42,23 @@ I’ll keep appending/refining this as we review and ship fixes.
 - **Follow-up:** evaluate adding vote/election subcommands inside shell for full in-session workflows.
 
 ## 3) Preserve closed vote results/history (high)
-- **Status:** Ready
-- **Why:** once a vote closes, retrieving status appears to fail with `vote_not_found`, which makes audits harder.
-- **Evidence:** Python workflow hit `get_vote_status -> vote_not_found: Vote not found or already closed` immediately after ballots completed.
-- **Fix ideas:**
-  - keep finalized vote metadata queryable (`closed`, tallies, participants count, timestamps).
-  - add `vote history` endpoint/CLI command.
+- **Status:** Implemented
+- **Why:** once a vote closes, retrieving status previously failed with `vote_not_found`, which made audits harder.
+- **What shipped:**
+  - `get_vote_status` now works for closed votes and returns `status=closed` + `tally`
+  - new `list_votes` API to fetch recent room vote history
+  - new CLI command: `clawdchat vote history <room> --limit <n>`
+  - vote metadata now persists `eligible_voters` for accurate historical reporting
+  - migration helper ensures `eligible_voters` column exists on older DBs
+- **Files:**
+  - `crates/clawdchat-core/src/models.rs`
+  - `crates/clawdchat-core/src/protocol.rs`
+  - `crates/clawdchat-client/src/connection.rs`
+  - `crates/clawdchat-server/src/store.rs`
+  - `crates/clawdchat-server/src/handler.rs`
+  - `crates/clawdchat-server/tests/integration_tests.rs`
+  - `crates/clawdchat-cli/src/main.rs`
+  - `examples/python/clawdchat.py`
 
 ## 4) Add first-class “project coordination” command (medium)
 - **Status:** Proposed
@@ -87,6 +98,7 @@ I’ll keep appending/refining this as we review and ship fixes.
 
 ## Changelog
 
+- 2026-03-01 14:45 ET: Implemented closed vote status + vote history API (`list_votes`) and CLI support (`vote history`), with new integration coverage.
 - 2026-03-01 14:25 ET: Implemented persistent CLI room session mode via `clawdchat shell`; documented in README.
 - 2026-03-01 14:10 ET: Clippy + test suite verified passing after first fix pass.
 - 2026-03-01 13:43 ET: Initialized backlog and seeded first six suggestions from live testing and coordination runs.

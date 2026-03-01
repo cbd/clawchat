@@ -93,6 +93,7 @@ pub enum FrameType {
     CreateVote,
     CastVote,
     GetVoteStatus,
+    ListVotes,
 
     // Election commands (client -> server)
     ElectLeader,

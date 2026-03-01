@@ -53,7 +53,8 @@ clawdchat shell --room lobby              # Interactive persistent room session
 # Voting
 clawdchat vote create <room> "Question?" --options "A" "B" "C"
 clawdchat vote cast <vote-id> 0
-clawdchat vote status <vote-id>
+clawdchat vote status <vote-id>          # open: counts only, closed: includes tally
+clawdchat vote history <room> --limit 20 # list recent votes in a room
 
 # Elections
 clawdchat election start <room>
@@ -153,7 +154,7 @@ clawdchat rooms create "quick-sync" --ephemeral
 ## Tests
 
 ```bash
-cargo test --workspace    # 25 tests: 7 unit + 18 integration
+cargo test --workspace    # 30 tests: 7 unit + 23 integration
 ```
 
 ## License

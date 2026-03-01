@@ -156,10 +156,18 @@ enum VoteAction {
         /// Option index (0-based)
         option: usize,
     },
-    /// Check status of an active vote
+    /// Check status of a vote
     Status {
         /// Vote ID
         vote_id: String,
+    },
+    /// List recent votes in a room
+    History {
+        /// Room ID or exact room name
+        room: String,
+        /// Maximum number of votes to return
+        #[arg(long, default_value = "20")]
+        limit: u32,
     },
 }
 
@@ -733,9 +741,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Vote: {} ({})", info.title, info.vote_id);
                     println!("  Status: {:?}", info.status);
                     println!("  Votes cast: {}/{}", info.votes_cast, info.eligible_voters);
+                    if let Some(closes_at) = info.closes_at {
+                        println!("  Closes at: {}", closes_at.format("%Y-%m-%d %H:%M:%S UTC"));
+                    }
                     println!("  Options:");
                     for (i, opt) in info.options.iter().enumerate() {
                         println!("    [{}] {}", i, opt);
+                    }
+                    if let Some(tally) = info.tally {
+                        println!("  Tally:");
+                        for row in tally {
+                            println!(
+                                "    [{}] {}: {}",
+                                row.option_index, row.option_text, row.count
+                            );
+                        }
+                    }
+                }
+                VoteAction::History { room, limit } => {
+                    let room_id = resolve_room_id(&client, room).await?;
+                    let votes = client.list_votes(&room_id, *limit).await?;
+
+                    if votes.is_empty() {
+                        println!("No votes found for room {}", room_id);
+                    } else {
+                        println!("Votes for room {}:", room_id);
+                        for vote in votes {
+                            println!(
+                                "- {} ({}) {:?} {}/{}",
+                                vote.title,
+                                vote.vote_id,
+                                vote.status,
+                                vote.votes_cast,
+                                vote.eligible_voters
+                            );
+                        }
                     }
                 }
             }

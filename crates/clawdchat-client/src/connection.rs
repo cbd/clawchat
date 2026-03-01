@@ -122,9 +122,7 @@ impl ClawdChatClient {
                                 }
                             }
                             // Otherwise it's a pushed event
-                            let _ = event_tx_clone.send(Event {
-                                frame,
-                            });
+                            let _ = event_tx_clone.send(Event { frame });
                         }
                     }
                     Err(_) => break,
@@ -162,9 +160,8 @@ impl ClawdChatClient {
             .map_err(|_| ClientError::ConnectionClosed)?;
 
         if response.frame_type == FrameType::Error {
-            let err: ErrorPayload = serde_json::from_value(response.payload).unwrap_or(
-                ErrorPayload::new(ErrorCode::InternalError, "Unknown error"),
-            );
+            let err: ErrorPayload = serde_json::from_value(response.payload)
+                .unwrap_or(ErrorPayload::new(ErrorCode::InternalError, "Unknown error"));
             return Err(ClientError::Server {
                 code: err.code,
                 message: err.message,
@@ -189,7 +186,11 @@ impl ClawdChatClient {
     }
 
     /// Send a request and wait for the response.
-    async fn request(&self, frame_type: FrameType, payload: serde_json::Value) -> Result<Frame, ClientError> {
+    async fn request(
+        &self,
+        frame_type: FrameType,
+        payload: serde_json::Value,
+    ) -> Result<Frame, ClientError> {
         let id = uuid::Uuid::new_v4().to_string();
         let frame = Frame {
             id: Some(id.clone()),
@@ -214,9 +215,8 @@ impl ClawdChatClient {
             .map_err(|_| ClientError::ConnectionClosed)?;
 
         if response.frame_type == FrameType::Error {
-            let err: ErrorPayload = serde_json::from_value(response.payload).unwrap_or(
-                ErrorPayload::new(ErrorCode::InternalError, "Unknown error"),
-            );
+            let err: ErrorPayload = serde_json::from_value(response.payload)
+                .unwrap_or(ErrorPayload::new(ErrorCode::InternalError, "Unknown error"));
             return Err(ClientError::Server {
                 code: err.code,
                 message: err.message,
@@ -256,11 +256,8 @@ impl ClawdChatClient {
     }
 
     pub async fn join_room(&self, room_id: &str) -> Result<(), ClientError> {
-        self.request(
-            FrameType::JoinRoom,
-            serde_json::json!({"room_id": room_id}),
-        )
-        .await?;
+        self.request(FrameType::JoinRoom, serde_json::json!({"room_id": room_id}))
+            .await?;
         Ok(())
     }
 
@@ -322,10 +319,7 @@ impl ClawdChatClient {
         Ok(messages)
     }
 
-    pub async fn list_rooms(
-        &self,
-        parent_id: Option<&str>,
-    ) -> Result<Vec<Room>, ClientError> {
+    pub async fn list_rooms(&self, parent_id: Option<&str>) -> Result<Vec<Room>, ClientError> {
         let resp = self
             .request(
                 FrameType::ListRooms,
@@ -341,10 +335,7 @@ impl ClawdChatClient {
         Ok(rooms)
     }
 
-    pub async fn list_agents(
-        &self,
-        room_id: Option<&str>,
-    ) -> Result<Vec<AgentInfo>, ClientError> {
+    pub async fn list_agents(&self, room_id: Option<&str>) -> Result<Vec<AgentInfo>, ClientError> {
         let resp = self
             .request(
                 FrameType::ListAgents,
@@ -362,10 +353,7 @@ impl ClawdChatClient {
 
     pub async fn room_info(&self, room_id: &str) -> Result<serde_json::Value, ClientError> {
         let resp = self
-            .request(
-                FrameType::RoomInfo,
-                serde_json::json!({"room_id": room_id}),
-            )
+            .request(FrameType::RoomInfo, serde_json::json!({"room_id": room_id}))
             .await?;
         Ok(resp.payload)
     }
@@ -416,11 +404,11 @@ impl ClawdChatClient {
         Ok(resp.payload)
     }
 
-    /// Get the current status of an active vote (does not reveal ballots).
-    pub async fn get_vote_status(
-        &self,
-        vote_id: &str,
-    ) -> Result<VoteInfo, ClientError> {
+    /// Get the current status of a vote.
+    ///
+    /// For open votes this reports counts only. For closed votes it also includes
+    /// revealed tally data.
+    pub async fn get_vote_status(&self, vote_id: &str) -> Result<VoteInfo, ClientError> {
         let resp = self
             .request(
                 FrameType::GetVoteStatus,
@@ -433,13 +421,36 @@ impl ClawdChatClient {
         Ok(serde_json::from_value(resp.payload).unwrap())
     }
 
+    /// List recent votes for a room (open and/or closed).
+    pub async fn list_votes(
+        &self,
+        room_id: &str,
+        limit: u32,
+    ) -> Result<Vec<VoteInfo>, ClientError> {
+        let resp = self
+            .request(
+                FrameType::ListVotes,
+                serde_json::to_value(ListVotesPayload {
+                    room_id: room_id.to_string(),
+                    limit,
+                })
+                .unwrap(),
+            )
+            .await?;
+
+        let votes: Vec<VoteInfo> = resp
+            .payload
+            .get("votes")
+            .cloned()
+            .and_then(|v| serde_json::from_value(v).ok())
+            .unwrap_or_default();
+        Ok(votes)
+    }
+
     // --- Election API ---
 
     /// Start a leader election in a room.
-    pub async fn elect_leader(
-        &self,
-        room_id: &str,
-    ) -> Result<serde_json::Value, ClientError> {
+    pub async fn elect_leader(&self, room_id: &str) -> Result<serde_json::Value, ClientError> {
         let resp = self
             .request(
                 FrameType::ElectLeader,
@@ -453,10 +464,7 @@ impl ClawdChatClient {
     }
 
     /// Decline an active election (opt out of candidacy).
-    pub async fn decline_election(
-        &self,
-        room_id: &str,
-    ) -> Result<serde_json::Value, ClientError> {
+    pub async fn decline_election(&self, room_id: &str) -> Result<serde_json::Value, ClientError> {
         let resp = self
             .request(
                 FrameType::DeclineElection,

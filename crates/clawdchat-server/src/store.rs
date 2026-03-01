@@ -8,6 +8,20 @@ pub struct Store {
     conn: Mutex<Connection>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VoteMeta {
+    pub vote_id: String,
+    pub room_id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub options: Vec<String>,
+    pub created_by: String,
+    pub created_at: DateTime<Utc>,
+    pub closes_at: Option<DateTime<Utc>>,
+    pub status: String,
+    pub eligible_voters: usize,
+}
+
 impl Store {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
@@ -71,15 +85,16 @@ impl Store {
             );
 
             CREATE TABLE IF NOT EXISTS votes (
-                vote_id      TEXT PRIMARY KEY,
-                room_id      TEXT NOT NULL,
-                title        TEXT NOT NULL,
-                description  TEXT,
-                options      TEXT NOT NULL DEFAULT '[]',
-                created_by   TEXT NOT NULL,
-                created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-                closes_at    TEXT,
-                status       TEXT NOT NULL DEFAULT 'open'
+                vote_id         TEXT PRIMARY KEY,
+                room_id         TEXT NOT NULL,
+                title           TEXT NOT NULL,
+                description     TEXT,
+                options         TEXT NOT NULL DEFAULT '[]',
+                created_by      TEXT NOT NULL,
+                created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                closes_at       TEXT,
+                status          TEXT NOT NULL DEFAULT 'open',
+                eligible_voters INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS vote_ballots (
@@ -95,6 +110,14 @@ impl Store {
                 VALUES ('lobby', 'lobby', 'Default room for all agents');
             ",
         )?;
+
+        ensure_column_exists(
+            &conn,
+            "votes",
+            "eligible_voters",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+
         Ok(())
     }
 
@@ -294,13 +317,14 @@ impl Store {
         options: &[String],
         created_by: &str,
         closes_at: Option<DateTime<Utc>>,
+        eligible_voters: usize,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         let options_json = serde_json::to_string(options).unwrap_or_default();
         let closes_str = closes_at.map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
         conn.execute(
-            "INSERT INTO votes (vote_id, room_id, title, description, options, created_by, closes_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![vote_id, room_id, title, description, options_json, created_by, closes_str],
+            "INSERT INTO votes (vote_id, room_id, title, description, options, created_by, closes_at, eligible_voters) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![vote_id, room_id, title, description, options_json, created_by, closes_str, eligible_voters as i64],
         )?;
         Ok(())
     }
@@ -384,29 +408,12 @@ impl Store {
         Ok(())
     }
 
-    pub fn get_vote_meta(
-        &self,
-        vote_id: &str,
-    ) -> Result<Option<(String, String, Option<String>, Vec<String>, String, DateTime<Utc>, Option<DateTime<Utc>>, String)>, StoreError> {
+    pub fn get_vote_meta(&self, vote_id: &str) -> Result<Option<VoteMeta>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let result = conn.query_row(
-            "SELECT room_id, title, description, options, created_by, created_at, closes_at, status FROM votes WHERE vote_id = ?1",
+            "SELECT vote_id, room_id, title, description, options, created_by, created_at, closes_at, status, eligible_voters FROM votes WHERE vote_id = ?1",
             params![vote_id],
-            |row| {
-                let options_str: String = row.get(3)?;
-                let closes_str: Option<String> = row.get(6)?;
-                let created_str: String = row.get(5)?;
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    serde_json::from_str(&options_str).unwrap_or_default(),
-                    row.get::<_, String>(4)?,
-                    parse_timestamp(&created_str),
-                    closes_str.map(|s| parse_timestamp(&s)),
-                    row.get::<_, String>(7)?,
-                ))
-            },
+            map_vote_meta_row,
         );
 
         match result {
@@ -414,6 +421,24 @@ impl Store {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(StoreError::Db(e)),
         }
+    }
+
+    pub fn list_votes(&self, room_id: &str, limit: u32) -> Result<Vec<VoteMeta>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT vote_id, room_id, title, description, options, created_by, created_at, closes_at, status, eligible_voters
+             FROM votes
+             WHERE room_id = ?1
+             ORDER BY created_at DESC, vote_id DESC
+             LIMIT ?2",
+        )?;
+
+        let rows = stmt.query_map(params![room_id, limit as i64], map_vote_meta_row)?;
+        let mut votes = Vec::new();
+        for row in rows {
+            votes.push(row?);
+        }
+        Ok(votes)
     }
 }
 
@@ -433,6 +458,32 @@ fn query_room_by_id(conn: &Connection, room_id: &str) -> Result<Option<Room>, St
     }
 }
 
+fn ensure_column_exists(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    column_sql: &str,
+) -> Result<(), rusqlite::Error> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = conn.prepare(&pragma)?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+
+    let mut exists = false;
+    for row in rows {
+        if row?.eq_ignore_ascii_case(column) {
+            exists = true;
+            break;
+        }
+    }
+
+    if !exists {
+        let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {column_sql}");
+        conn.execute(&alter, [])?;
+    }
+
+    Ok(())
+}
+
 fn map_room_row(row: &rusqlite::Row) -> rusqlite::Result<Room> {
     Ok(Room {
         room_id: row.get(0)?,
@@ -442,6 +493,25 @@ fn map_room_row(row: &rusqlite::Row) -> rusqlite::Result<Room> {
         ephemeral: false,
         created_at: parse_timestamp(&row.get::<_, String>(5)?),
         created_by: row.get(4)?,
+    })
+}
+
+fn map_vote_meta_row(row: &rusqlite::Row) -> rusqlite::Result<VoteMeta> {
+    let options_str: String = row.get(4)?;
+    let closes_str: Option<String> = row.get(7)?;
+    let created_str: String = row.get(6)?;
+
+    Ok(VoteMeta {
+        vote_id: row.get(0)?,
+        room_id: row.get(1)?,
+        title: row.get(2)?,
+        description: row.get(3)?,
+        options: serde_json::from_str(&options_str).unwrap_or_default(),
+        created_by: row.get(5)?,
+        created_at: parse_timestamp(&created_str),
+        closes_at: closes_str.map(|s| parse_timestamp(&s)),
+        status: row.get(8)?,
+        eligible_voters: row.get::<_, i64>(9)? as usize,
     })
 }
 
@@ -507,7 +577,13 @@ mod tests {
     fn test_create_and_get_room() {
         let store = Store::open_in_memory().unwrap();
         let room = store
-            .create_room("test-room", "test-room", Some("A test"), None, Some("agent-1"))
+            .create_room(
+                "test-room",
+                "test-room",
+                Some("A test"),
+                None,
+                Some("agent-1"),
+            )
             .unwrap();
         assert_eq!(room.name, "test-room");
         assert_eq!(room.description, Some("A test".into()));

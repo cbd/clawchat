@@ -1,4 +1,5 @@
 use clawdchat_core::*;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::broker::Broker;
@@ -21,24 +22,103 @@ pub async fn handle_frame(
     match frame.frame_type {
         FrameType::Ping => Frame::pong(req_id),
 
-        FrameType::CreateRoom => handle_create_room(req_id, frame.payload, agent_id, broker, store, ephemeral_rooms).await,
-        FrameType::JoinRoom => handle_join_room(req_id, frame.payload, agent_id, agent_name, broker, store, ephemeral_rooms).await,
-        FrameType::LeaveRoom => handle_leave_room(req_id, frame.payload, agent_id, broker, ephemeral_rooms).await,
-        FrameType::SendMessage => handle_send_message(req_id, frame.payload, agent_id, agent_name, broker, store, ephemeral_rooms).await,
+        FrameType::CreateRoom => {
+            handle_create_room(
+                req_id,
+                frame.payload,
+                agent_id,
+                broker,
+                store,
+                ephemeral_rooms,
+            )
+            .await
+        }
+        FrameType::JoinRoom => {
+            handle_join_room(
+                req_id,
+                frame.payload,
+                agent_id,
+                agent_name,
+                broker,
+                store,
+                ephemeral_rooms,
+            )
+            .await
+        }
+        FrameType::LeaveRoom => {
+            handle_leave_room(req_id, frame.payload, agent_id, broker, ephemeral_rooms).await
+        }
+        FrameType::SendMessage => {
+            handle_send_message(
+                req_id,
+                frame.payload,
+                agent_id,
+                agent_name,
+                broker,
+                store,
+                ephemeral_rooms,
+            )
+            .await
+        }
         FrameType::GetHistory => handle_get_history(req_id, frame.payload, store).await,
-        FrameType::ListRooms => handle_list_rooms(req_id, frame.payload, store, ephemeral_rooms).await,
+        FrameType::ListRooms => {
+            handle_list_rooms(req_id, frame.payload, store, ephemeral_rooms).await
+        }
         FrameType::ListAgents => handle_list_agents(req_id, frame.payload, broker).await,
-        FrameType::RoomInfo => handle_room_info(req_id, frame.payload, store, broker, ephemeral_rooms).await,
+        FrameType::RoomInfo => {
+            handle_room_info(req_id, frame.payload, store, broker, ephemeral_rooms).await
+        }
 
         // Voting
-        FrameType::CreateVote => handle_create_vote(req_id, frame.payload, agent_id, broker, store, ephemeral_rooms, vote_mgr).await,
-        FrameType::CastVote => handle_cast_vote(req_id, frame.payload, agent_id, agent_name, broker, store, vote_mgr).await,
-        FrameType::GetVoteStatus => handle_get_vote_status(req_id, frame.payload, vote_mgr, broker).await,
+        FrameType::CreateVote => {
+            handle_create_vote(
+                req_id,
+                frame.payload,
+                agent_id,
+                broker,
+                store,
+                ephemeral_rooms,
+                vote_mgr,
+            )
+            .await
+        }
+        FrameType::CastVote => {
+            handle_cast_vote(
+                req_id,
+                frame.payload,
+                agent_id,
+                agent_name,
+                broker,
+                store,
+                vote_mgr,
+            )
+            .await
+        }
+        FrameType::GetVoteStatus => {
+            handle_get_vote_status(req_id, frame.payload, vote_mgr, store).await
+        }
+        FrameType::ListVotes => handle_list_votes(req_id, frame.payload, vote_mgr, store).await,
 
         // Elections
-        FrameType::ElectLeader => handle_elect_leader(req_id, frame.payload, agent_id, broker, vote_mgr).await,
-        FrameType::DeclineElection => handle_decline_election(req_id, frame.payload, agent_id, vote_mgr).await,
-        FrameType::Decision => handle_decision(req_id, frame.payload, agent_id, agent_name, broker, store, ephemeral_rooms, vote_mgr).await,
+        FrameType::ElectLeader => {
+            handle_elect_leader(req_id, frame.payload, agent_id, broker, vote_mgr).await
+        }
+        FrameType::DeclineElection => {
+            handle_decline_election(req_id, frame.payload, agent_id, vote_mgr).await
+        }
+        FrameType::Decision => {
+            handle_decision(
+                req_id,
+                frame.payload,
+                agent_id,
+                agent_name,
+                broker,
+                store,
+                ephemeral_rooms,
+                vote_mgr,
+            )
+            .await
+        }
 
         _ => Frame::error(
             req_id,
@@ -89,8 +169,8 @@ async fn handle_create_room(
     } else {
         // Validate parent exists if specified
         if let Some(ref pid) = p.parent_id {
-            let parent_exists = store.get_room(pid).ok().flatten().is_some()
-                || ephemeral_rooms.contains_key(pid);
+            let parent_exists =
+                store.get_room(pid).ok().flatten().is_some() || ephemeral_rooms.contains_key(pid);
             if !parent_exists {
                 return Frame::error(
                     req_id,
@@ -99,9 +179,16 @@ async fn handle_create_room(
             }
         }
 
-        match store.create_room(&room_id, &p.name, p.description.as_deref(), p.parent_id.as_deref(), Some(agent_id)) {
+        match store.create_room(
+            &room_id,
+            &p.name,
+            p.description.as_deref(),
+            p.parent_id.as_deref(),
+            Some(agent_id),
+        ) {
             Ok(room) => {
-                let event = Frame::event(FrameType::RoomCreated, serde_json::to_value(&room).unwrap());
+                let event =
+                    Frame::event(FrameType::RoomCreated, serde_json::to_value(&room).unwrap());
                 for entry in broker.agents.iter() {
                     broker.send_to_agent(entry.key(), event.clone());
                 }
@@ -109,7 +196,10 @@ async fn handle_create_room(
             }
             Err(crate::store::StoreError::RoomNameTaken(name)) => Frame::error(
                 req_id,
-                ErrorPayload::new(ErrorCode::RoomNameTaken, format!("Room name '{}' already taken", name)),
+                ErrorPayload::new(
+                    ErrorCode::RoomNameTaken,
+                    format!("Room name '{}' already taken", name),
+                ),
             ),
             Err(e) => Frame::error(
                 req_id,
@@ -352,9 +442,8 @@ async fn handle_list_rooms(
     store: &Arc<Store>,
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
 ) -> Frame {
-    let p: ListRoomsPayload = serde_json::from_value(payload).unwrap_or(ListRoomsPayload {
-        parent_id: None,
-    });
+    let p: ListRoomsPayload =
+        serde_json::from_value(payload).unwrap_or(ListRoomsPayload { parent_id: None });
 
     let mut rooms = match store.list_rooms(p.parent_id.as_deref()) {
         Ok(r) => r,
@@ -391,9 +480,8 @@ async fn handle_list_agents(
     payload: serde_json::Value,
     broker: &Arc<Broker>,
 ) -> Frame {
-    let p: ListAgentsPayload = serde_json::from_value(payload).unwrap_or(ListAgentsPayload {
-        room_id: None,
-    });
+    let p: ListAgentsPayload =
+        serde_json::from_value(payload).unwrap_or(ListAgentsPayload { room_id: None });
 
     let agents: Vec<AgentInfo> = match &p.room_id {
         Some(room_id) => {
@@ -455,9 +543,7 @@ async fn handle_room_info(
         .collect();
 
     // Get sub-rooms
-    let mut sub_rooms = store
-        .list_rooms(Some(&p.room_id))
-        .unwrap_or_default();
+    let mut sub_rooms = store.list_rooms(Some(&p.room_id)).unwrap_or_default();
     for entry in ephemeral_rooms.iter() {
         if entry.value().parent_id.as_deref() == Some(&p.room_id) {
             sub_rooms.push(entry.value().clone());
@@ -518,7 +604,9 @@ async fn handle_create_vote(
 
     // Persist to SQLite if not ephemeral
     if !is_ephemeral {
-        let closes_at = p.duration_secs.map(|s| chrono::Utc::now() + chrono::Duration::seconds(s as i64));
+        let closes_at = p
+            .duration_secs
+            .map(|s| chrono::Utc::now() + chrono::Duration::seconds(s as i64));
         if let Err(e) = store.create_vote(
             &vote_id,
             &p.room_id,
@@ -527,6 +615,7 @@ async fn handle_create_vote(
             &p.options,
             agent_id,
             closes_at,
+            eligible,
         ) {
             return Frame::error(
                 req_id,
@@ -562,6 +651,7 @@ async fn handle_create_vote(
         status: VoteStatus::Open,
         votes_cast: 0,
         eligible_voters: eligible,
+        tally: None,
     };
 
     // Broadcast VoteCreated to room
@@ -621,7 +711,14 @@ async fn handle_cast_vote(
 
     // Record in-memory (may trigger close + broadcast)
     match vote_mgr
-        .cast_vote(&p.vote_id, agent_id, agent_name, p.option_index, broker, store)
+        .cast_vote(
+            &p.vote_id,
+            agent_id,
+            agent_name,
+            p.option_index,
+            broker,
+            store,
+        )
         .await
     {
         Ok((votes_cast, eligible)) => Frame::ok(
@@ -639,11 +736,68 @@ async fn handle_cast_vote(
     }
 }
 
+fn vote_status_from_str(status: &str) -> VoteStatus {
+    if status.eq_ignore_ascii_case("closed") {
+        VoteStatus::Closed
+    } else {
+        VoteStatus::Open
+    }
+}
+
+fn build_vote_tally(options: &[String], ballots: &[(String, String, usize)]) -> Vec<VoteTally> {
+    let mut tally_counts = vec![0usize; options.len()];
+    for (_, _, option_index) in ballots {
+        if *option_index < tally_counts.len() {
+            tally_counts[*option_index] += 1;
+        }
+    }
+
+    options
+        .iter()
+        .enumerate()
+        .map(|(idx, option)| VoteTally {
+            option_index: idx,
+            option_text: option.clone(),
+            count: tally_counts[idx],
+        })
+        .collect()
+}
+
+fn vote_info_from_meta(
+    meta: &crate::store::VoteMeta,
+    votes_cast: usize,
+    tally: Option<Vec<VoteTally>>,
+) -> VoteInfo {
+    VoteInfo {
+        vote_id: meta.vote_id.clone(),
+        room_id: meta.room_id.clone(),
+        title: meta.title.clone(),
+        description: meta.description.clone(),
+        options: meta.options.clone(),
+        created_by: meta.created_by.clone(),
+        created_at: meta.created_at,
+        closes_at: meta.closes_at,
+        status: vote_status_from_str(&meta.status),
+        votes_cast,
+        eligible_voters: meta.eligible_voters,
+        tally,
+    }
+}
+
+fn load_closed_vote_tally(
+    store: &Arc<Store>,
+    vote_id: &str,
+    options: &[String],
+) -> Result<Vec<VoteTally>, crate::store::StoreError> {
+    let ballots = store.get_vote_ballots(vote_id)?;
+    Ok(build_vote_tally(options, &ballots))
+}
+
 async fn handle_get_vote_status(
     req_id: Option<&str>,
     payload: serde_json::Value,
     vote_mgr: &Arc<VoteManager>,
-    _broker: &Arc<Broker>,
+    store: &Arc<Store>,
 ) -> Frame {
     let p: GetVoteStatusPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -655,7 +809,7 @@ async fn handle_get_vote_status(
         }
     };
 
-    // Check in-memory active votes first
+    // Check in-memory active votes first.
     if let Some(vote) = vote_mgr.active_votes.get(&p.vote_id) {
         let info = VoteInfo {
             vote_id: vote.vote_id.clone(),
@@ -669,14 +823,148 @@ async fn handle_get_vote_status(
             status: VoteStatus::Open,
             votes_cast: vote.ballots.len(),
             eligible_voters: vote.eligible_voters,
+            tally: None,
         };
         return Frame::ok(req_id, serde_json::to_value(&info).unwrap());
     }
 
-    // Not active -- vote not found (closed votes are already broadcast as VoteResult)
-    Frame::error(
+    // Fallback to persisted vote metadata (supports closed vote status queries).
+    let Some(meta) = (match store.get_vote_meta(&p.vote_id) {
+        Ok(meta) => meta,
+        Err(e) => {
+            return Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::InternalError, e.to_string()),
+            )
+        }
+    }) else {
+        return Frame::error(
+            req_id,
+            ErrorPayload::new(ErrorCode::VoteNotFound, "Vote not found"),
+        );
+    };
+
+    let votes_cast = match store.get_vote_ballot_count(&meta.vote_id) {
+        Ok(v) => v,
+        Err(e) => {
+            return Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::InternalError, e.to_string()),
+            )
+        }
+    };
+
+    let tally = if meta.status.eq_ignore_ascii_case("closed") {
+        match load_closed_vote_tally(store, &meta.vote_id, &meta.options) {
+            Ok(tally) => Some(tally),
+            Err(e) => {
+                return Frame::error(
+                    req_id,
+                    ErrorPayload::new(ErrorCode::InternalError, e.to_string()),
+                )
+            }
+        }
+    } else {
+        None
+    };
+
+    let info = vote_info_from_meta(&meta, votes_cast, tally);
+    Frame::ok(req_id, serde_json::to_value(&info).unwrap())
+}
+
+async fn handle_list_votes(
+    req_id: Option<&str>,
+    payload: serde_json::Value,
+    vote_mgr: &Arc<VoteManager>,
+    store: &Arc<Store>,
+) -> Frame {
+    let p: ListVotesPayload = match serde_json::from_value(payload) {
+        Ok(p) => p,
+        Err(e) => {
+            return Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::InvalidPayload, e.to_string()),
+            )
+        }
+    };
+
+    let mut seen_vote_ids: HashSet<String> = HashSet::new();
+    let mut votes: Vec<VoteInfo> = Vec::new();
+
+    for entry in vote_mgr.active_votes.iter() {
+        let vote = entry.value();
+        if vote.room_id != p.room_id {
+            continue;
+        }
+
+        seen_vote_ids.insert(vote.vote_id.clone());
+        votes.push(VoteInfo {
+            vote_id: vote.vote_id.clone(),
+            room_id: vote.room_id.clone(),
+            title: vote.title.clone(),
+            description: vote.description.clone(),
+            options: vote.options.clone(),
+            created_by: vote.created_by.clone(),
+            created_at: vote.created_at,
+            closes_at: vote.closes_at,
+            status: VoteStatus::Open,
+            votes_cast: vote.ballots.len(),
+            eligible_voters: vote.eligible_voters,
+            tally: None,
+        });
+    }
+
+    let persisted_votes = match store.list_votes(&p.room_id, p.limit) {
+        Ok(votes) => votes,
+        Err(e) => {
+            return Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::InternalError, e.to_string()),
+            )
+        }
+    };
+
+    for meta in persisted_votes {
+        if seen_vote_ids.contains(&meta.vote_id) {
+            continue;
+        }
+
+        let votes_cast = match store.get_vote_ballot_count(&meta.vote_id) {
+            Ok(v) => v,
+            Err(e) => {
+                return Frame::error(
+                    req_id,
+                    ErrorPayload::new(ErrorCode::InternalError, e.to_string()),
+                )
+            }
+        };
+
+        let tally = if meta.status.eq_ignore_ascii_case("closed") {
+            match load_closed_vote_tally(store, &meta.vote_id, &meta.options) {
+                Ok(tally) => Some(tally),
+                Err(e) => {
+                    return Frame::error(
+                        req_id,
+                        ErrorPayload::new(ErrorCode::InternalError, e.to_string()),
+                    )
+                }
+            }
+        } else {
+            None
+        };
+
+        votes.push(vote_info_from_meta(&meta, votes_cast, tally));
+    }
+
+    votes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    votes.truncate(p.limit as usize);
+
+    Frame::ok(
         req_id,
-        ErrorPayload::new(ErrorCode::VoteNotFound, "Vote not found or already closed"),
+        serde_json::json!({
+            "room_id": p.room_id,
+            "votes": votes,
+        }),
     )
 }
 
@@ -799,7 +1087,10 @@ async fn handle_decision(
     if !vote_mgr.is_leader(&p.room_id, agent_id) {
         return Frame::error(
             req_id,
-            ErrorPayload::new(ErrorCode::NotLeader, "Only the room leader can issue decisions"),
+            ErrorPayload::new(
+                ErrorCode::NotLeader,
+                "Only the room leader can issue decisions",
+            ),
         );
     }
 
