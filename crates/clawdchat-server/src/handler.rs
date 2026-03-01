@@ -76,7 +76,7 @@ pub async fn handle_frame(
         }
         FrameType::GetHistory => handle_get_history(req_id, frame.payload, store).await,
         FrameType::ListRooms => {
-            handle_list_rooms(req_id, frame.payload, store, ephemeral_rooms, agent_api_key, no_auth)
+            handle_list_rooms(req_id, frame.payload, store, ephemeral_rooms, agent_api_key, no_auth, broker)
                 .await
         }
         FrameType::ListAgents => handle_list_agents(req_id, frame.payload, broker).await,
@@ -133,6 +133,11 @@ pub async fn handle_frame(
                 vote_mgr,
             )
             .await
+        }
+
+        // Presence
+        FrameType::SetTyping => {
+            handle_set_typing(req_id, frame.payload, agent_id, agent_name, broker).await
         }
 
         // Tasks
@@ -200,6 +205,8 @@ async fn handle_create_room(
             created_by: Some(agent_id.to_string()),
             visibility: visibility.to_string(),
             owner_key: if agent_api_key.is_empty() { None } else { Some(agent_api_key.to_string()) },
+            last_activity: None,
+            member_count: None,
         };
         ephemeral_rooms.insert(room_id.clone(), room.clone());
 
@@ -485,6 +492,11 @@ async fn handle_send_message(
         rate_limiter.increment_message(agent_api_key);
     }
 
+    // Update last_active on the agent
+    if let Some(mut agent) = broker.agents.get_mut(agent_id) {
+        agent.info.last_active = Some(chrono::Utc::now());
+    }
+
     // Broadcast to room members (excluding sender)
     let event = Frame::event(
         FrameType::MessageReceived,
@@ -515,7 +527,7 @@ async fn handle_get_history(
         }
     };
 
-    match store.get_history(&p.room_id, p.limit, p.before) {
+    match store.get_history_since(&p.room_id, p.limit, p.before, p.since.as_deref()) {
         Ok(messages) => Frame {
             id: Some(uuid::Uuid::new_v4().to_string()),
             reply_to: req_id.map(String::from),
@@ -539,6 +551,7 @@ async fn handle_list_rooms(
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
     agent_api_key: &str,
     no_auth: bool,
+    broker: &Arc<Broker>,
 ) -> Frame {
     let p: ListRoomsPayload =
         serde_json::from_value(payload).unwrap_or(ListRoomsPayload { parent_id: None });
@@ -586,6 +599,18 @@ async fn handle_list_rooms(
                 || room.owner_key.as_deref() == Some(agent_api_key);
             if visible {
                 rooms.push(room.clone());
+            }
+        }
+    }
+
+    // Enrich rooms with member counts and last activity
+    for room in &mut rooms {
+        let count = broker.get_room_members(&room.room_id).len();
+        room.member_count = Some(count);
+        // Get last message timestamp from store for permanent rooms
+        if !room.ephemeral {
+            if let Ok(msgs) = store.get_history(&room.room_id, 1, None) {
+                room.last_activity = msgs.last().map(|m| m.timestamp);
             }
         }
     }
@@ -1261,6 +1286,52 @@ async fn handle_decision(
             "room_id": p.room_id,
         }),
     )
+}
+
+// --- Presence handlers ---
+
+async fn handle_set_typing(
+    req_id: Option<&str>,
+    payload: serde_json::Value,
+    agent_id: &str,
+    agent_name: &str,
+    broker: &Arc<Broker>,
+) -> Frame {
+    let p: SetTypingPayload = match serde_json::from_value(payload) {
+        Ok(p) => p,
+        Err(e) => {
+            return Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::InvalidPayload, e.to_string()),
+            )
+        }
+    };
+
+    if !broker.is_agent_in_room(agent_id, &p.room_id) {
+        return Frame::error(
+            req_id,
+            ErrorPayload::new(ErrorCode::NotInRoom, "Not in this room"),
+        );
+    }
+
+    // Update last_active
+    if let Some(mut agent) = broker.agents.get_mut(agent_id) {
+        agent.info.last_active = Some(chrono::Utc::now());
+    }
+
+    // Broadcast typing indicator to room (excluding sender)
+    let event = Frame::event(
+        FrameType::TypingIndicator,
+        serde_json::json!({
+            "room_id": p.room_id,
+            "agent_id": agent_id,
+            "agent_name": agent_name,
+            "typing": p.typing,
+        }),
+    );
+    broker.broadcast_to_room(&p.room_id, agent_id, &event);
+
+    Frame::ok(req_id, serde_json::json!({"room_id": p.room_id}))
 }
 
 // --- Task handlers ---

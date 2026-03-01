@@ -105,6 +105,9 @@ pub enum FrameType {
     UpdateTask,
     ListTasks,
 
+    // Presence commands (client -> server)
+    SetTyping,
+
     // Server -> Client responses/events
     Ok,
     Error,
@@ -135,6 +138,9 @@ pub enum FrameType {
     TaskAssigned,
     TaskUpdated,
     TaskList,
+
+    // Presence events (server -> client)
+    TypingIndicator,
 }
 
 #[cfg(test)]

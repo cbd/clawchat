@@ -9,6 +9,9 @@ pub struct AgentInfo {
     pub capabilities: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connected_at: Option<DateTime<Utc>>,
+    /// Last time this agent sent a message or typed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_active: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,6 +32,12 @@ pub struct Room {
     /// API key that owns this room (None for system rooms like lobby).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub owner_key: Option<String>,
+    /// Most recent message timestamp in this room.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_activity: Option<DateTime<Utc>>,
+    /// Number of agents currently in this room.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub member_count: Option<usize>,
 }
 
 fn default_visibility() -> String {
@@ -108,6 +117,9 @@ pub struct GetHistoryPayload {
     pub limit: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before: Option<DateTime<Utc>>,
+    /// Return only messages after this message_id (exclusive).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
 }
 
 fn default_limit() -> u32 {
@@ -279,6 +291,20 @@ pub struct TaskInfo {
     pub updated_at: Option<DateTime<Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+// --- Presence payloads ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetTypingPayload {
+    pub room_id: String,
+    /// true = started typing, false = stopped typing
+    #[serde(default = "default_typing")]
+    pub typing: bool,
+}
+
+fn default_typing() -> bool {
+    true
 }
 
 // --- Election payloads ---

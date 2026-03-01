@@ -443,6 +443,7 @@ where
         name: agent_name.clone(),
         capabilities: agent_capabilities.clone(),
         connected_at: Some(chrono::Utc::now()),
+        last_active: Some(chrono::Utc::now()),
     };
 
     // Store the connection

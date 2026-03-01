@@ -287,8 +287,37 @@ impl Store {
         limit: u32,
         before: Option<DateTime<Utc>>,
     ) -> Result<Vec<ChatMessage>, StoreError> {
+        self.get_history_since(room_id, limit, before, None)
+    }
+
+    /// Get message history with optional `since` (message_id) filter.
+    /// Returns messages after the given message_id, up to `limit`.
+    pub fn get_history_since(
+        &self,
+        room_id: &str,
+        limit: u32,
+        before: Option<DateTime<Utc>>,
+        since: Option<&str>,
+    ) -> Result<Vec<ChatMessage>, StoreError> {
         let conn = self.conn.lock().unwrap();
         let mut messages = Vec::new();
+
+        if let Some(since_id) = since {
+            // Get the rowid of the since message, then return messages after it
+            let mut stmt = conn.prepare(
+                "SELECT message_id, room_id, agent_id, agent_name, content, reply_to_message, metadata, created_at
+                 FROM messages WHERE room_id = ?1 AND rowid > (
+                     SELECT rowid FROM messages WHERE message_id = ?2
+                 )
+                 ORDER BY created_at ASC, rowid ASC LIMIT ?3",
+            )?;
+            let rows = stmt.query_map(params![room_id, since_id, limit], map_message_row)?;
+            for row in rows {
+                messages.push(row?);
+            }
+            // Already in chronological order
+            return Ok(messages);
+        }
 
         match before {
             Some(before_ts) => {
@@ -630,6 +659,8 @@ fn map_room_row(row: &rusqlite::Row) -> rusqlite::Result<Room> {
         created_by: row.get(4)?,
         visibility: row.get::<_, String>(6).unwrap_or_else(|_| "private".to_string()),
         owner_key: row.get(7)?,
+        last_activity: None,
+        member_count: None,
     })
 }
 

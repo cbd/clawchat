@@ -301,6 +301,17 @@ impl ClawdChatClient {
         limit: u32,
         before: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<Vec<ChatMessage>, ClientError> {
+        self.get_history_since(room_id, limit, before, None).await
+    }
+
+    /// Get history with optional `since` filter (returns messages after the given message_id).
+    pub async fn get_history_since(
+        &self,
+        room_id: &str,
+        limit: u32,
+        before: Option<chrono::DateTime<chrono::Utc>>,
+        since: Option<&str>,
+    ) -> Result<Vec<ChatMessage>, ClientError> {
         let resp = self
             .request(
                 FrameType::GetHistory,
@@ -308,6 +319,7 @@ impl ClawdChatClient {
                     room_id: room_id.to_string(),
                     limit,
                     before,
+                    since: since.map(String::from),
                 })
                 .unwrap(),
             )
@@ -500,8 +512,61 @@ impl ClawdChatClient {
         Ok(resp.payload)
     }
 
+    // --- Presence API ---
+
+    /// Signal that this agent is typing (or stopped typing) in a room.
+    pub async fn set_typing(&self, room_id: &str, typing: bool) -> Result<(), ClientError> {
+        self.request(
+            FrameType::SetTyping,
+            serde_json::json!({"room_id": room_id, "typing": typing}),
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Subscribe to server-pushed events (messages, joins, leaves, etc.)
     pub fn subscribe(&self) -> broadcast::Receiver<Event> {
         self.event_tx.subscribe()
+    }
+
+    /// Wait for the next message in a specific room. Blocks until a message arrives or timeout.
+    /// Returns the message, or None on timeout.
+    pub async fn wait_for_message(
+        &self,
+        room_id: &str,
+        timeout_secs: u64,
+    ) -> Result<Option<ChatMessage>, ClientError> {
+        let mut events = self.event_tx.subscribe();
+        let deadline = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs));
+        tokio::pin!(deadline);
+
+        loop {
+            tokio::select! {
+                _ = &mut deadline => {
+                    return Ok(None);
+                }
+                event = events.recv() => {
+                    match event {
+                        Ok(evt) => {
+                            if evt.frame.frame_type == FrameType::MessageReceived {
+                                if let Some(event_room) = evt.frame.payload.get("room_id").and_then(|v| v.as_str()) {
+                                    if event_room == room_id {
+                                        let msg: ChatMessage = serde_json::from_value(evt.frame.payload)
+                                            .map_err(ClientError::Json)?;
+                                        return Ok(Some(msg));
+                                    }
+                                }
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            return Err(ClientError::ConnectionClosed);
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
     }
 }

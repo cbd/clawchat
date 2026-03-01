@@ -67,6 +67,21 @@ enum Commands {
         /// Stream new messages (like tail -f)
         #[arg(long)]
         follow: bool,
+        /// Only return messages after this message ID
+        #[arg(long)]
+        since: Option<String>,
+    },
+
+    /// Wait for a new message in a room (blocks until one arrives)
+    Wait {
+        /// Room ID or name
+        room: String,
+        /// Timeout in seconds (0 = wait forever)
+        #[arg(long, default_value = "60")]
+        timeout: u64,
+        /// Output as JSON instead of human-readable
+        #[arg(long)]
+        json: bool,
     },
 
     /// Monitor events in real-time
@@ -536,8 +551,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if rooms.is_empty() {
                         println!("No rooms found.");
                     } else {
-                        println!("{:<38} {:<20} {:<10} DESCRIPTION", "ID", "NAME", "TYPE");
-                        println!("{}", "-".repeat(80));
+                        println!("{:<38} {:<20} {:<10} {:<8} {:<20} DESCRIPTION", "ID", "NAME", "TYPE", "MEMBERS", "LAST ACTIVITY");
+                        println!("{}", "-".repeat(130));
                         for room in rooms {
                             let room_type = if room.ephemeral {
                                 "ephemeral"
@@ -545,9 +560,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "permanent"
                             };
                             let desc = room.description.as_deref().unwrap_or("");
+                            let members = room.member_count.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string());
+                            let activity = room.last_activity
+                                .map(|t| t.format("%H:%M:%S").to_string())
+                                .unwrap_or_else(|| "-".to_string());
                             println!(
-                                "{:<38} {:<20} {:<10} {}",
-                                room.room_id, room.name, room_type, desc
+                                "{:<38} {:<20} {:<10} {:<8} {:<20} {}",
+                                room.room_id, room.name, room_type, members, activity, desc
                             );
                         }
                     }
@@ -596,11 +615,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             room,
             limit,
             follow,
+            since,
         } => {
             let client = connect(&cli).await?;
 
-            // Show history
-            let messages = client.get_history(room, *limit, None).await?;
+            // Show history (with optional --since filter)
+            let messages = client.get_history_since(room, *limit, None, since.as_deref()).await?;
             for msg in &messages {
                 println!(
                     "[{}] {}: {}",
@@ -648,6 +668,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        Commands::Wait { room, timeout, json } => {
+            let client = connect(&cli).await?;
+            let room_id = resolve_room_id(&client, room).await?;
+            let _ = client.join_room(&room_id).await;
+
+            let effective_timeout = if *timeout == 0 { 86400 } else { *timeout }; // 0 = 24h
+
+            match client.wait_for_message(&room_id, effective_timeout).await? {
+                Some(msg) => {
+                    if *json {
+                        println!("{}", serde_json::to_string(&msg)?);
+                    } else {
+                        println!(
+                            "[{}] {}: {}",
+                            msg.timestamp.format("%H:%M:%S"),
+                            msg.agent_name,
+                            msg.content
+                        );
+                    }
+                }
+                None => {
+                    eprintln!("Timed out after {}s waiting for a message", timeout);
+                    std::process::exit(1);
                 }
             }
         }
