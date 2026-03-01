@@ -1,0 +1,27 @@
+[workspace]
+members = [
+    "crates/clawdchat-core",
+    "crates/clawdchat-server",
+    "crates/clawdchat-cli",
+    "crates/clawdchat-client",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/chadd/clawdchat"
+
+[workspace.dependencies]
+clawdchat-core = { path = "crates/clawdchat-core" }
+clawdchat-server = { path = "crates/clawdchat-server" }
+clawdchat-client = { path = "crates/clawdchat-client" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+log = "0.4"
+env_logger = "0.11"

@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.swp
+*.swo
+.DS_Store
+
+# Runtime data
+*.db
+*.db-wal
+*.db-shm
+clawdchat.sock
+auth.key

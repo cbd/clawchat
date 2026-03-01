@@ -1,0 +1,31 @@
+[package]
+name = "clawdchat-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ClawdChat client library for agent integration"
+
+[dependencies]
+clawdchat-core.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "sync", "rt", "macros", "time"] }
+serde_json.workspace = true
+uuid.workspace = true
+log.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+
+[[example]]
+name = "simple_chat"
+path = "../../examples/rust/simple_chat.rs"
+
+[[example]]
+name = "voting"
+path = "../../examples/rust/voting.rs"
+
+[[example]]
+name = "leader_election"
+path = "../../examples/rust/leader_election.rs"
+
+[[example]]
+name = "build_together"
+path = "../../examples/rust/build_together.rs"
