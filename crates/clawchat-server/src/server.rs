@@ -287,7 +287,7 @@ where
     let mut line = String::new();
 
     // Phase 1: Wait for register command
-    let (agent_id, agent_name, agent_capabilities, session_id, agent_api_key, reconnected_rooms) = loop {
+    let (agent_id, agent_name, agent_capabilities, session_id, agent_api_key, reconnected_rooms, takeover_rooms) = loop {
         line.clear();
         let n = reader.read_line(&mut line).await?;
         if n == 0 {
@@ -369,6 +369,7 @@ where
         // === Reconnect logic ===
         // If the agent requests reconnect and we have stashed state, reclaim it.
         let mut reconnected_rooms: Option<HashSet<String>> = None;
+        let mut takeover_rooms: Option<HashSet<String>> = None;
         let mut missed_messages: Vec<Frame> = Vec::new();
 
         if payload.reconnect && reconnect_mgr.is_stashed(&agent_id) {
@@ -376,14 +377,27 @@ where
                 reconnected_rooms = Some(stashed.rooms);
                 missed_messages = stashed.missed_messages;
             }
-        } else if broker.agents.contains_key(&agent_id) {
-            // Agent is still "connected" (stale) — reject
-            let err = Frame::error(
-                frame.id.as_deref(),
-                ErrorPayload::new(ErrorCode::AgentIdTaken, "Agent ID already in use"),
-            );
-            write_half.write_all(err.to_line()?.as_bytes()).await?;
-            continue;
+        } else if let Some(existing) = broker.agents.get(&agent_id) {
+            if payload.reconnect {
+                // Take over a still-live connection with the same agent_id. Covers
+                // the race where a prior one-shot call's disconnect hasn't been
+                // processed yet — the newest connection wins. We inherit the old
+                // connection's rooms; replacing its broker entry below drops the
+                // old sender (ending its send task), and the old reader's later
+                // cleanup is a no-op because it checks session ownership.
+                let rooms = existing.rooms.clone();
+                drop(existing);
+                takeover_rooms = Some(rooms);
+            } else {
+                // Still "connected" and not a reconnect — reject.
+                drop(existing);
+                let err = Frame::error(
+                    frame.id.as_deref(),
+                    ErrorPayload::new(ErrorCode::AgentIdTaken, "Agent ID already in use"),
+                );
+                write_half.write_all(err.to_line()?.as_bytes()).await?;
+                continue;
+            }
         }
 
         // Build the OK response
@@ -431,7 +445,7 @@ where
             &payload.capabilities,
         );
 
-        break (agent_id, payload.name, payload.capabilities, session_id, authenticated_key, reconnected_rooms);
+        break (agent_id, payload.name, payload.capabilities, session_id, authenticated_key, reconnected_rooms, takeover_rooms);
     };
 
     // Phase 2: Set up channel + task pair
@@ -474,6 +488,19 @@ where
         agent_api_key.clone(),
     );
     broker.agents.insert(agent_id.clone(), conn);
+
+    // If we took over a still-live connection, the agent is still in its rooms
+    // (we never left them). Restore its room set on the new connection and
+    // re-assert membership idempotently — no rejoin broadcast, since peers
+    // never saw it leave.
+    if let Some(rooms) = takeover_rooms {
+        for room_id in &rooms {
+            broker.join_room(&agent_id, room_id);
+        }
+        if let Some(mut agent) = broker.agents.get_mut(&agent_id) {
+            agent.rooms = rooms;
+        }
+    }
 
     // Restore room memberships if reconnecting
     if let Some(rooms) = reconnected_rooms {
@@ -598,6 +625,19 @@ where
     // Remove from rate limiter
     if !agent_api_key.is_empty() {
         rate_limiter.remove_agent(&agent_api_key);
+    }
+
+    // If a newer connection took over this agent_id (take-over / reconnect race),
+    // it now owns the rooms and registry entry — don't tear them down. Just end
+    // our own session record and exit.
+    let still_mine = broker
+        .agents
+        .get(&agent_id)
+        .map(|c| c.session_id == session_id)
+        .unwrap_or(false);
+    if !still_mine {
+        let _ = store.record_session_end(&session_id);
+        return Ok(());
     }
 
     // Collect room memberships BEFORE leaving them (for stash)

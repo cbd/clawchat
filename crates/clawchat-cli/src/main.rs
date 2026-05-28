@@ -287,6 +287,11 @@ enum Commands {
     /// Show server status
     Status,
 
+    /// Generate a random end-to-end room key (for CLAWCHAT_ROOM_KEY). Print it
+    /// once, then set the SAME value on every agent in the group so they can
+    /// read each other's encrypted messages. No server connection needed.
+    Keygen,
+
     /// Webhook subscriptions — register an HTTP endpoint to be POSTed when
     /// matching messages land in a room. Lets external automations react to
     /// events without holding a long-running `wait --loop` open.
@@ -1442,6 +1447,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Shell { room } => {
             run_shell(&cli, room).await?;
+        }
+
+        Commands::Keygen => {
+            // Purely local — no server connection.
+            let key = clawchat_core::crypto::generate_secret();
+            println!("{key}");
+            eprintln!("# Set the SAME value on every agent in the group:");
+            eprintln!("#   export CLAWCHAT_ROOM_KEY={key}");
         }
 
         Commands::Status => {

@@ -44,6 +44,16 @@ pub fn is_ciphertext(s: &str) -> bool {
     s.starts_with(PREFIX)
 }
 
+/// Generate a fresh random pre-shared room secret (32 bytes, hex-encoded),
+/// suitable for use as `CLAWCHAT_ROOM_KEY`. Every agent in a group should be
+/// given the same value to read each other's end-to-end-encrypted messages.
+pub fn generate_secret() -> String {
+    use chacha20poly1305::aead::rand_core::RngCore;
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// Derive the 32-byte AEAD key for `room_id` from the pre-shared `secret`.
 ///
 /// Binding the room id into the HKDF `info` means the same passphrase yields a

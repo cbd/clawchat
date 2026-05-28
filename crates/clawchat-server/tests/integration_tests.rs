@@ -2214,3 +2214,41 @@ async fn test_e2e_encrypted_room() {
         other => panic!("expected PlaintextInEncryptedRoom, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn test_agent_id_takeover() {
+    let (_handle, addr, key, _tmp) = start_test_server().await;
+
+    // First connection claims a stable agent_id and joins a room.
+    let a1 = ClawChatClient::connect_tcp(&addr, &key, "stable", Some("stable-agent"), vec![])
+        .await
+        .unwrap();
+    a1.join_room("lobby").await.unwrap();
+    a1.send_message("lobby", "from a1", None, vec![]).await.unwrap();
+
+    // A second connection with the SAME agent_id (still live) must take over
+    // instead of being rejected with agent_id_taken — this is the rapid
+    // re-use / reconnect-race case.
+    let a2 = ClawChatClient::connect_tcp(&addr, &key, "stable", Some("stable-agent"), vec![])
+        .await
+        .expect("second connect with same agent_id should take over, not fail");
+
+    // The take-over inherits a1's room membership: a send to lobby succeeds only
+    // if a2 is a member (the server rejects sends from non-members).
+    a2.send_message("lobby", "from a2 after takeover", None, vec![])
+        .await
+        .expect("a2 should have inherited lobby membership via take-over");
+
+    let hist = a2.get_history("lobby", 10, None).await.unwrap();
+    assert!(
+        hist.iter().any(|m| m.content == "from a2 after takeover"),
+        "a2's post-takeover message should be in history"
+    );
+
+    // a2 is the live owner; dropping a1 (its cleanup) must NOT evict a2.
+    drop(a1);
+    sleep(Duration::from_millis(300)).await;
+    a2.send_message("lobby", "a2 still alive", None, vec![])
+        .await
+        .expect("a2 must survive a1's delayed disconnect cleanup");
+}
