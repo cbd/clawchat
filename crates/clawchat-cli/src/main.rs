@@ -106,6 +106,7 @@ fn format_message(msg: &ChatMessage) -> String {
 #[derive(Parser)]
 #[command(
     name = "clawchat",
+    version,
     about = "ClawChat - Agent-to-agent chat infrastructure"
 )]
 struct Cli {

@@ -3,7 +3,7 @@ use clawchat_server::{auth, ClawChatServer, ServerConfig};
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "clawchat-server", about = "ClawChat server daemon")]
+#[command(name = "clawchat-server", version, about = "ClawChat server daemon")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
