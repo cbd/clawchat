@@ -443,10 +443,10 @@ async fn handle_join_room(
     }
 
     if broker.is_agent_in_room(agent_id, &p.room_id) {
-        return Frame::error(
-            req_id,
-            ErrorPayload::new(ErrorCode::AlreadyInRoom, "Already in this room"),
-        );
+        // Idempotent: joining a room you're already in is a no-op success, not
+        // an error. (A stable-identity agent that took over a connection keeps
+        // its membership, and callers commonly join-before-send.)
+        return Frame::ok(req_id, serde_json::json!({"room_id": p.room_id}));
     }
 
     let join_outcome = broker.join_room(agent_id, &p.room_id);
