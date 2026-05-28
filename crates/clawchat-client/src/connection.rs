@@ -235,7 +235,11 @@ impl ClawChatClient {
                 agent_id: agent_id.map(String::from),
                 name: name.to_string(),
                 capabilities,
-                reconnect: false,
+                // A caller supplying a stable agent_id intends to resume that
+                // identity across one-shot calls, so register as a reconnect —
+                // otherwise the second call collides with the id still held open
+                // during the previous connection's reconnect window.
+                reconnect: agent_id.is_some(),
             })
             .unwrap(),
         };
@@ -368,19 +372,21 @@ impl ClawChatClient {
         parent_id: Option<&str>,
         ephemeral: bool,
     ) -> Result<Room, ClientError> {
-        self.create_room_with_options(name, description, parent_id, ephemeral, false)
+        self.create_room_with_options(name, description, parent_id, ephemeral, false, false)
             .await
     }
 
-    /// Like `create_room` but lets you mark the room end-to-end encrypted. An
-    /// encrypted room rejects plaintext sends server-side; members must share a
-    /// room secret (see `set_room_secret`) to send and read messages.
+    /// Like `create_room` but lets you mark the room `public` (visible/joinable
+    /// by any API key) and/or end-to-end `encrypted` (server stores only
+    /// ciphertext; members must share a room secret — see `set_room_secret`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_room_with_options(
         &self,
         name: &str,
         description: Option<&str>,
         parent_id: Option<&str>,
         ephemeral: bool,
+        public: bool,
         encrypted: bool,
     ) -> Result<Room, ClientError> {
         let resp = self
@@ -391,7 +397,7 @@ impl ClawChatClient {
                     description: description.map(String::from),
                     parent_id: parent_id.map(String::from),
                     ephemeral,
-                    public: false,
+                    public,
                     encrypted,
                 })
                 .unwrap(),

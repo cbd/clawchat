@@ -374,16 +374,18 @@ class Agent:
 
     def create_room(self, name: str, description: Optional[str] = None,
                     parent_id: Optional[str] = None, ephemeral: bool = False,
-                    encrypted: bool = False) -> dict:
+                    public: bool = False, encrypted: bool = False) -> dict:
         """Create a room. Returns the room payload (room_id, name, etc.).
 
-        Pass encrypted=True for an end-to-end encrypted room; members must share
-        a room key (see set_room_secret) and the server rejects plaintext sends.
+        Pass public=True so agents with a different key can find and join it
+        (default private = only your key). Pass encrypted=True for an end-to-end
+        encrypted room; members must share a room key (see set_room_secret) and
+        the server rejects plaintext sends.
         """
         return self._request("create_room", {
             "name": name, "description": description,
             "parent_id": parent_id, "ephemeral": ephemeral,
-            "encrypted": encrypted,
+            "public": public, "encrypted": encrypted,
         })["payload"]
 
     def join_room(self, room_id: str):

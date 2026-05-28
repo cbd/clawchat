@@ -136,6 +136,12 @@ struct Cli {
     #[arg(long, global = true, default_value = "cli")]
     name: String,
 
+    /// Stable agent id for this session. Pass a consistent value across calls so
+    /// the server treats your separate send/wait invocations as ONE agent —
+    /// required for leader election and reconnect to work across one-shot calls.
+    #[arg(long, global = true)]
+    agent_id: Option<String>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -357,6 +363,11 @@ enum RoomAction {
         /// Create as ephemeral (auto-deleted when empty)
         #[arg(long)]
         ephemeral: bool,
+        /// Create as public: visible and joinable by any API key on the server.
+        /// Default is private (only your key can see or resolve it by name) —
+        /// use this so agents with different keys can find the room.
+        #[arg(long)]
+        public: bool,
         /// Create as end-to-end encrypted. Members must share a room key
         /// (--room-key or $CLAWCHAT_ROOM_KEY); the server stores only
         /// ciphertext and rejects plaintext sends to this room.
@@ -551,12 +562,13 @@ fn decrypt_field(secret: Option<&[u8]>, room_id: &str, content: &str) -> String 
 async fn connect(cli: &Cli) -> Result<ClawChatClient, Box<dyn std::error::Error>> {
     let key = load_key(&cli.key)?;
 
+    let agent_id = cli.agent_id.as_deref();
     let mut client = if let Some(url) = &cli.url {
-        ClawChatClient::connect_ws(url, &key, &cli.name, None, vec![]).await?
+        ClawChatClient::connect_ws(url, &key, &cli.name, agent_id, vec![]).await?
     } else if let Some(addr) = &cli.tcp {
-        ClawChatClient::connect_tcp(addr, &key, &cli.name, None, vec![]).await?
+        ClawChatClient::connect_tcp(addr, &key, &cli.name, agent_id, vec![]).await?
     } else {
-        ClawChatClient::connect_uds(&cli.socket, &key, &cli.name, None, vec![]).await?
+        ClawChatClient::connect_uds(&cli.socket, &key, &cli.name, agent_id, vec![]).await?
     };
     if let Some(secret) = resolve_room_secret(cli) {
         client.set_room_secret(&secret);
@@ -913,6 +925,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     description,
                     parent,
                     ephemeral,
+                    public,
                     encrypted,
                 } => {
                     let room = client
@@ -921,6 +934,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             description.as_deref(),
                             parent.as_deref(),
                             *ephemeral,
+                            *public,
                             *encrypted,
                         )
                         .await?;
@@ -928,6 +942,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if room.ephemeral {
                         println!("  Type: ephemeral (auto-deleted when empty)");
                     }
+                    println!(
+                        "  Visibility: {}",
+                        if room.visibility == "public" {
+                            "public (any key can find & join)"
+                        } else {
+                            "private (only your key)"
+                        }
+                    );
                     if room.encrypted {
                         println!("  End-to-end encrypted: members need a shared room key");
                         if resolve_room_secret(&cli).is_none() {

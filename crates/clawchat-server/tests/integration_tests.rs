@@ -2145,7 +2145,7 @@ async fn test_e2e_encrypted_room() {
 
     // Alice creates a persistent end-to-end encrypted room.
     let room = alice
-        .create_room_with_options("vault", None, None, false, true)
+        .create_room_with_options("vault", None, None, false, false, true)
         .await
         .unwrap();
     assert!(room.encrypted, "room should be marked encrypted");
