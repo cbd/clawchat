@@ -42,6 +42,10 @@ pub struct TierLimits {
     /// cap is set generously: `clw1:` ciphertext is base64 (~33% larger than the
     /// plaintext). This is a DoS guard against giant payloads, not a UX limit.
     pub max_message_bytes: usize,
+    /// Days of message history retained before the background purge deletes it.
+    /// `None` = retained indefinitely (enterprise). Doubles as the disk guard on
+    /// the lowest tier and as an upsell lever on higher ones.
+    pub history_retention_days: Option<u32>,
 }
 
 impl TierLimits {
@@ -51,6 +55,7 @@ impl TierLimits {
             max_messages_per_minute: 200,
             max_rooms: 50,
             max_message_bytes: 64 * 1024,
+            history_retention_days: Some(14),
         }
     }
 
@@ -60,6 +65,7 @@ impl TierLimits {
             max_messages_per_minute: 2000,
             max_rooms: 500,
             max_message_bytes: 256 * 1024,
+            history_retention_days: Some(90),
         }
     }
 

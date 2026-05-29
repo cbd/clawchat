@@ -22,6 +22,8 @@ use crate::voting::VoteManager;
 const HEARTBEAT_INTERVAL_SECS: u64 = 30;
 /// If no data received from an agent within this window, disconnect them.
 const HEARTBEAT_TIMEOUT_SECS: u64 = 90;
+/// How often the background task purges messages past their tier's retention.
+const PURGE_INTERVAL: Duration = Duration::from_secs(3600);
 
 pub struct ServerConfig {
     pub socket_path: PathBuf,
@@ -213,6 +215,35 @@ impl ClawChatServer {
         } else {
             None
         };
+
+        // Background retention purge: periodically delete messages past each
+        // tier's retention window so the DB doesn't grow without bound. Tiers
+        // with no window (None = enterprise) are never queried, so their data is
+        // kept. Runs once on start, then every PURGE_INTERVAL.
+        let purge_store = self.store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(PURGE_INTERVAL);
+            loop {
+                tick.tick().await;
+                let mut total = 0usize;
+                for (tier, limits) in [("free", TierLimits::free()), ("pro", TierLimits::pro())] {
+                    if let Some(days) = limits.history_retention_days {
+                        let modifier = format!("-{days} days");
+                        match purge_store.purge_messages_by_tier(tier, &modifier) {
+                            Ok(n) => total += n,
+                            Err(e) => log::warn!("retention purge ({tier}) failed: {e}"),
+                        }
+                    }
+                }
+                // No VACUUM: SQLite reuses the freed pages, so a fixed retention
+                // window bounds file growth on its own. A full VACUUM would hold
+                // the single store mutex through a whole-DB rebuild — a server-
+                // wide stall we don't want on an interval.
+                if total > 0 {
+                    log::info!("retention purge: deleted {total} expired message(s)");
+                }
+            }
+        });
 
         // Wait for shutdown signal
         tokio::select! {

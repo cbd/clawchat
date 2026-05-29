@@ -5,6 +5,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
+mod lantern;
+
 /// `metadata.kind` marking the last message of a conversation. `send --end` sets
 /// it; `wait` exits 3 on receiving one so a reply-then-wait loop terminates.
 const KIND_CONVERSATION_END: &str = "conversation_end";
@@ -282,6 +284,21 @@ enum Commands {
         /// truncate large stdout payloads.
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
+        /// Wake on the next message, then emit EVERY unread message through the
+        /// room's current tip (one JSON object per line), not just the one that
+        /// woke the wait. Drain before composing so a correction that landed
+        /// while you were thinking isn't answered a turn late. The cursor advances
+        /// to the last message in the batch.
+        #[arg(long)]
+        drain: bool,
+        /// Persist the highest processed seq to this file and read it back as the
+        /// floor on the next run — so you run the SAME command each turn and the
+        /// read cursor only ever advances to messages you actually received.
+        /// Takes precedence over --since-seq (which then just seeds the first
+        /// run, before the file exists). This is the fix for "advanced my cursor
+        /// past an unread peer message": track last-processed, never last-sent.
+        #[arg(long)]
+        cursor_file: Option<PathBuf>,
     },
 
     /// Monitor events in real-time
@@ -362,6 +379,141 @@ enum Commands {
         #[arg(long)]
         progress: Option<u8>,
     },
+
+    /// LANTERN: an optional structured-reasoning overlay (HELLO + falsifiable
+    /// claims, challenges, resolutions, synthesis). Carried inside message
+    /// content — no server changes; state is reconstructed from history. Use it
+    /// when a conversation is contested, high-stakes, or state-changing.
+    Lantern {
+        #[command(subcommand)]
+        action: LanternAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum LanternAction {
+    /// Send a HELLO provenance preamble (identity, role, capability claims —
+    /// all self-attested; advertises, does NOT grant, permissions).
+    Hello {
+        /// Room ID or name
+        room: String,
+        #[arg(long)]
+        provider: Option<String>,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        role: Option<String>,
+        /// Repeatable capability as `name` or `name=falsifiable_by`.
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+    },
+    /// Open a thread with a question.
+    Probe {
+        room: String,
+        question: String,
+        #[arg(long)]
+        intent: Option<String>,
+    },
+    /// Make a falsifiable claim (opens a thread). `--falsifiable-by` is required.
+    Assert {
+        room: String,
+        #[arg(long)]
+        claim: String,
+        #[arg(long)]
+        confidence: Option<f64>,
+        #[arg(long = "falsifiable-by")]
+        falsifiable_by: String,
+        #[arg(long)]
+        intent: Option<String>,
+    },
+    /// Counter an ASSERT/CHALLENGE in a thread. Must stake confidence + a test.
+    Challenge {
+        room: String,
+        #[arg(long)]
+        thread: i64,
+        #[arg(long = "target-seq")]
+        target_seq: i64,
+        #[arg(long = "counter-claim")]
+        counter_claim: String,
+        #[arg(long)]
+        confidence: f64,
+        #[arg(long)]
+        test: String,
+    },
+    /// Record the observation that settles a branch (basis: tool/artifact/human/consensus/stale).
+    Resolve {
+        room: String,
+        #[arg(long)]
+        thread: i64,
+        #[arg(long)]
+        observation: String,
+        #[arg(long)]
+        basis: String,
+    },
+    /// Commit synthesis + shared-state delta into a thread (the commit point).
+    Fuse {
+        room: String,
+        #[arg(long)]
+        thread: i64,
+        #[arg(long)]
+        synthesis: String,
+        /// Path to a JSON file holding the shared_state_delta object.
+        #[arg(long = "state-delta")]
+        state_delta: Option<PathBuf>,
+        /// Preserve an intentional split rather than committing one model.
+        #[arg(long)]
+        split: bool,
+        /// Repeatable calibration verdict `<seq>=<true|false>`: did that staked
+        /// claim hold? Only scored when the thread's RESOLVE basis is tool/artifact/human.
+        #[arg(long = "outcome")]
+        outcomes: Vec<String>,
+    },
+    /// Reconcile shared state without prose (a state hash + JSON diff file).
+    Sync {
+        room: String,
+        #[arg(long)]
+        thread: Option<i64>,
+        #[arg(long = "state-hash")]
+        state_hash: Option<String>,
+        #[arg(long = "diff")]
+        diff: Option<PathBuf>,
+    },
+    /// Introduce a scarce, orthogonal idea (side channel; answer with harvest/bury).
+    Spark {
+        room: String,
+        #[arg(long)]
+        seed: String,
+        #[arg(long = "why-now")]
+        why_now: String,
+        #[arg(long = "smallest-test")]
+        smallest_test: String,
+    },
+    /// Accept a SPARK into the working set.
+    Harvest {
+        room: String,
+        #[arg(long = "spark-seq")]
+        spark_seq: i64,
+        #[arg(long)]
+        becomes: Option<String>,
+    },
+    /// Decline a SPARK in one sentence.
+    Bury {
+        room: String,
+        #[arg(long = "spark-seq")]
+        spark_seq: i64,
+        #[arg(long)]
+        reason: String,
+    },
+    /// List threads in a room (id, state, headline).
+    Threads { room: String },
+    /// Show every message in one thread, in order.
+    Show { room: String, thread: i64 },
+    /// Show the committed shared-state deltas (the agreed model).
+    State { room: String },
+    /// Show per-agent calibration loss (lower is better; diagnostic only).
+    Calibration { room: String },
+    /// Validate a LANTERN envelope from a file (or `-` for stdin).
+    Validate { path: String },
 }
 
 #[derive(Subcommand)]
@@ -1221,26 +1373,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             only_kind,
             show_thinking,
             output,
+            drain,
+            cursor_file,
         } => {
             let client = connect(&cli).await?;
             let room_id = resolve_room_id(&client, room).await?;
             let _ = client.join_room(&room_id).await;
 
+            // A cursor file, when present, is the source of truth for the read
+            // floor: it holds the highest seq we've actually processed, so the
+            // floor never jumps ahead to our own sent message. It overrides
+            // --since-seq, which then only seeds the first run (file absent).
+            let cursor_seq: Option<i64> = cursor_file.as_ref().and_then(|p| {
+                std::fs::read_to_string(p)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+            });
+
             // Resolve `--since-seq tip|auto` to the room's current tip. Done
             // BEFORE the wait subscribes so we don't miss anything arriving
             // between the tip read and the subscribe (the SDK's wait subscribes
             // first, then checks history with since_seq — that closes the race).
-            let resolved_since_seq: Option<i64> = match since_seq.as_deref() {
-                None => None,
-                Some(s) if s.eq_ignore_ascii_case("tip") || s.eq_ignore_ascii_case("auto") => {
-                    Some(client.room_tip(&room_id).await?)
+            let resolved_since_seq: Option<i64> = if let Some(seq) = cursor_seq {
+                Some(seq)
+            } else {
+                match since_seq.as_deref() {
+                    None => None,
+                    Some(s) if s.eq_ignore_ascii_case("tip") || s.eq_ignore_ascii_case("auto") => {
+                        Some(client.room_tip(&room_id).await?)
+                    }
+                    Some(s) => Some(s.parse::<i64>().map_err(|e| {
+                        Box::<dyn std::error::Error>::from(format!(
+                            "--since-seq must be an integer, 'tip', or 'auto': {}",
+                            e
+                        ))
+                    })?),
                 }
-                Some(s) => Some(s.parse::<i64>().map_err(|e| {
-                    Box::<dyn std::error::Error>::from(format!(
-                        "--since-seq must be an integer, 'tip', or 'auto': {}",
-                        e
-                    ))
-                })?),
             };
 
             // Announce we're waiting so other agents in the room know someone is blocked.
@@ -1468,24 +1636,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             match matched? {
                 Some(msg) => {
-                    // JSON is the default (machine-readable); --text opts into human form.
-                    let rendered = if *text {
-                        format_message(&msg)
+                    // In --drain mode, re-pull every unread message through the
+                    // current tip and emit them all, so a correction that landed
+                    // while we were composing is seen this turn, not a turn late.
+                    // Otherwise just the single wake message.
+                    let batch: Vec<ChatMessage> = if *drain {
+                        let mut all = client
+                            .get_history_filtered(&room_id, 500, None, None, resolved_since_seq)
+                            .await
+                            .unwrap_or_default();
+                        // Same filtering as wait: drop thinking/system pulses and
+                        // our own posts.
+                        all.retain(|m| {
+                            let t = m.metadata.get("type").and_then(|v| v.as_str());
+                            t != Some("thinking") && t != Some("system") && m.agent_name != cli.name
+                        });
+                        // Ephemeral rooms don't persist history, so the wake
+                        // message may be absent — include it exactly once.
+                        if !all.iter().any(|m| m.seq == msg.seq) {
+                            all.push(msg.clone());
+                        }
+                        all.sort_by_key(|m| m.seq);
+                        all.dedup_by_key(|m| m.seq);
+                        all
                     } else {
-                        serde_json::to_string(&msg)?
+                        vec![msg.clone()]
                     };
+
+                    // JSON is the default (machine-readable, one object per line);
+                    // --text opts into human form.
+                    let rendered = batch
+                        .iter()
+                        .map(|m| {
+                            if *text {
+                                format_message(m)
+                            } else {
+                                serde_json::to_string(m).unwrap_or_default()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
                     match output {
                         Some(path) => {
                             std::fs::write(path, format!("{}\n", rendered))?;
-                            eprintln!("wrote message #{} to {}", msg.seq, path.display());
+                            eprintln!("wrote {} message(s) to {}", batch.len(), path.display());
                         }
                         None => println!("{}", rendered),
                     }
-                    // A peer that ended the conversation: surface the message, then
-                    // exit 3 so a reply-then-wait loop stops instead of waiting again.
-                    if msg.metadata.get("kind").and_then(|v| v.as_str())
-                        == Some(KIND_CONVERSATION_END)
-                    {
+
+                    // Advance the cursor to the highest seq we just processed —
+                    // never our own sent seq, only what we received.
+                    let tip_seq = batch.last().map(|m| m.seq).unwrap_or(msg.seq);
+                    if let Some(path) = cursor_file {
+                        if let Err(e) = std::fs::write(path, tip_seq.to_string()) {
+                            eprintln!(
+                                "warning: failed to write cursor file {}: {e}",
+                                path.display()
+                            );
+                        }
+                    }
+                    if *drain {
+                        eprintln!("drained through seq {tip_seq}");
+                    }
+
+                    // If any message in the batch ended the conversation, stop the
+                    // loop (exit 3) instead of waiting for another turn.
+                    if batch.iter().any(|m| {
+                        m.metadata.get("kind").and_then(|v| v.as_str()) == Some(KIND_CONVERSATION_END)
+                    }) {
                         eprintln!("Peer ended the conversation.");
                         std::process::exit(3);
                     }
@@ -1785,8 +2003,238 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("{}", msg);
         }
+
+        Commands::Lantern { action } => {
+            lantern_cmd(&cli, action).await?;
+        }
     }
 
+    Ok(())
+}
+
+/// Send a LANTERN envelope as a room message: validate, then post with a
+/// `kind:"lantern"` metadata marker (content is encrypted by the client in
+/// encrypted rooms). Prints the assigned seq; for opening verbs that seq IS the
+/// thread id. Refuses to send a malformed envelope.
+async fn lantern_send(
+    cli: &Cli,
+    room: &str,
+    value: serde_json::Value,
+    opening: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let errs = lantern::validate(&value);
+    if !errs.is_empty() {
+        return Err(format!("malformed LANTERN message:\n  - {}", errs.join("\n  - ")).into());
+    }
+    let client = connect(cli).await?;
+    let room_id = resolve_room_id(&client, room).await?;
+    client.join_room(&room_id).await?;
+    let content = serde_json::to_string(&value)?;
+    let msg = client
+        .send_message_with_metadata(
+            &room_id,
+            &content,
+            None,
+            vec![],
+            serde_json::json!({ "kind": lantern::LANTERN_KIND }),
+        )
+        .await?;
+    let verb = value.get("type").and_then(|v| v.as_str()).unwrap_or("?");
+    if opening {
+        println!("{verb} sent as seq {0} — thread id is {0}", msg.seq);
+    } else {
+        println!("{verb} sent as seq {}", msg.seq);
+    }
+    Ok(())
+}
+
+/// Load and decrypt a room's history for client-side LANTERN reconstruction.
+async fn lantern_history(
+    cli: &Cli,
+    room: &str,
+) -> Result<Vec<ChatMessage>, Box<dyn std::error::Error>> {
+    let client = connect(cli).await?;
+    let room_id = resolve_room_id(&client, room).await?;
+    Ok(client.get_history_filtered(&room_id, 1000, None, None, None).await?)
+}
+
+async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        LanternAction::Hello { room, provider, model, role, capabilities } => {
+            let caps = capabilities
+                .iter()
+                .map(|c| {
+                    let (name, fby) = c.split_once('=').unwrap_or((c.as_str(), ""));
+                    lantern::Capability {
+                        name: name.trim().to_string(),
+                        falsifiable_by: (!fby.trim().is_empty()).then(|| fby.trim().to_string()),
+                    }
+                })
+                .collect();
+            let hello = lantern::Hello::new(&cli.name, provider.clone(), model.clone(), role.clone(), caps);
+            lantern_send(cli, room, serde_json::to_value(hello)?, false).await?;
+        }
+        LanternAction::Probe { room, question, intent } => {
+            let env = lantern::Envelope::new("PROBE", &cli.name, None, None, intent.clone(),
+                serde_json::json!({ "question": question }));
+            lantern_send(cli, room, serde_json::to_value(env)?, true).await?;
+        }
+        LanternAction::Assert { room, claim, confidence, falsifiable_by, intent } => {
+            let mut body = serde_json::json!({ "claim": claim, "falsifiable_by": falsifiable_by });
+            if let Some(c) = confidence {
+                body["confidence"] = serde_json::json!(c);
+            }
+            let env = lantern::Envelope::new("ASSERT", &cli.name, None, None, intent.clone(), body);
+            lantern_send(cli, room, serde_json::to_value(env)?, true).await?;
+        }
+        LanternAction::Challenge { room, thread, target_seq, counter_claim, confidence, test } => {
+            let env = lantern::Envelope::new("CHALLENGE", &cli.name, Some(*thread), Some(*target_seq), None,
+                serde_json::json!({ "target_seq": target_seq, "counter_claim": counter_claim, "confidence": confidence, "test": test }));
+            lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
+        }
+        LanternAction::Resolve { room, thread, observation, basis } => {
+            let env = lantern::Envelope::new("RESOLVE", &cli.name, Some(*thread), None, None,
+                serde_json::json!({ "observation": observation, "basis": basis }));
+            lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
+        }
+        LanternAction::Fuse { room, thread, synthesis, state_delta, split, outcomes } => {
+            let mut body = serde_json::json!({ "synthesis": synthesis, "split": split });
+            if let Some(path) = state_delta {
+                let raw = std::fs::read_to_string(path)?;
+                body["shared_state_delta"] = serde_json::from_str(&raw)?;
+            }
+            if !outcomes.is_empty() {
+                let mut map = serde_json::Map::new();
+                for o in outcomes {
+                    let (seq, verdict) = o.split_once('=')
+                        .ok_or_else(|| format!("--outcome must be <seq>=<true|false>, got `{o}`"))?;
+                    map.insert(seq.trim().to_string(), serde_json::json!(verdict.trim().parse::<bool>()?));
+                }
+                body["outcomes"] = serde_json::Value::Object(map);
+            }
+            let env = lantern::Envelope::new("FUSE", &cli.name, Some(*thread), None, None, body);
+            lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
+        }
+        LanternAction::Sync { room, thread, state_hash, diff } => {
+            let mut body = serde_json::json!({});
+            if let Some(h) = state_hash {
+                body["state_hash"] = serde_json::json!(h);
+            }
+            if let Some(path) = diff {
+                body["diff"] = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+            }
+            let env = lantern::Envelope::new("SYNC", &cli.name, *thread, None, None, body);
+            lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
+        }
+        LanternAction::Spark { room, seed, why_now, smallest_test } => {
+            let env = lantern::Envelope::new("SPARK", &cli.name, None, None, None,
+                serde_json::json!({ "seed": seed, "why_now": why_now, "smallest_test": smallest_test }));
+            lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
+        }
+        LanternAction::Harvest { room, spark_seq, becomes } => {
+            let env = lantern::Envelope::new("HARVEST", &cli.name, None, Some(*spark_seq), None,
+                serde_json::json!({ "spark_seq": spark_seq, "becomes": becomes }));
+            lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
+        }
+        LanternAction::Bury { room, spark_seq, reason } => {
+            let env = lantern::Envelope::new("BURY", &cli.name, None, Some(*spark_seq), None,
+                serde_json::json!({ "spark_seq": spark_seq, "reason": reason }));
+            lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
+        }
+        LanternAction::Threads { room } => {
+            let rec = lantern::reconstruct(&lantern_history(cli, room).await?);
+            // Provenance first: who has announced themselves via HELLO.
+            if !rec.hellos.is_empty() {
+                println!("Participants (HELLO, self-attested):");
+                for (seq, h) in &rec.hellos {
+                    let who = [h.provider.as_deref(), h.model.as_deref(), h.role.as_deref()]
+                        .into_iter()
+                        .flatten()
+                        .collect::<Vec<_>>()
+                        .join(" / ");
+                    let caps = h.capabilities.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
+                    println!("  #{seq} {} — {} [{}]", h.agent_name, if who.is_empty() { "?".into() } else { who }, caps);
+                }
+                println!();
+            }
+            if rec.threads.is_empty() {
+                println!("No LANTERN threads in this room.");
+                return Ok(());
+            }
+            println!("{:<8} {:<9} {:<8} HEADLINE", "THREAD", "STATE", "MSGS");
+            for t in &rec.threads {
+                let state = match t.state {
+                    lantern::ThreadState::Open => "open",
+                    lantern::ThreadState::Resolved => "resolved",
+                    lantern::ThreadState::Fused => "fused",
+                };
+                println!("{:<8} {:<9} {:<8} {}", t.id, state, t.messages.len(), t.headline());
+            }
+            // Surface the REFRACTION-due nudge (every third FUSE across the room).
+            if rec.fuse_count > 0 && rec.fuse_count % 3 == 0 {
+                eprintln!("note: {} FUSEs — the next FUSE is REFRACTION-due (non-author picks the lens).", rec.fuse_count);
+            }
+        }
+        LanternAction::Show { room, thread } => {
+            let rec = lantern::reconstruct(&lantern_history(cli, room).await?);
+            match rec.threads.iter().find(|t| t.id == *thread) {
+                None => println!("No thread {thread} in this room."),
+                Some(t) => {
+                    for m in &t.messages {
+                        let intent = m.intent.as_deref().map(|i| format!("  // {i}")).unwrap_or_default();
+                        println!("#{} {} {}{}", m.seq, m.from, m.verb, intent);
+                        println!("    {}", serde_json::to_string(&m.body).unwrap_or_default());
+                    }
+                }
+            }
+        }
+        LanternAction::State { room } => {
+            let rec = lantern::reconstruct(&lantern_history(cli, room).await?);
+            if rec.shared_state.is_empty() {
+                println!("No committed shared state (no FUSE with a shared_state_delta yet).");
+                return Ok(());
+            }
+            println!("Committed shared-state deltas (in FUSE order):");
+            for (i, d) in rec.shared_state.iter().enumerate() {
+                println!("  {}. {}", i + 1, serde_json::to_string(d).unwrap_or_default());
+            }
+        }
+        LanternAction::Calibration { room } => {
+            let rec = lantern::reconstruct(&lantern_history(cli, room).await?);
+            let cal = lantern::calibration(&rec);
+            if cal.per_agent.is_empty() {
+                println!("No calibration data yet (needs FUSEd threads with tool/artifact/human basis and recorded outcomes).");
+                return Ok(());
+            }
+            println!("{:<20} {:<10} CLAIMS", "AGENT", "MEAN LOSS");
+            for (agent, (_, n)) in &cal.per_agent {
+                let mean = cal.mean(agent).unwrap_or(0.0);
+                println!("{:<20} {:<10.4} {}", agent, mean, n);
+            }
+            println!("(lower loss is better; diagnostic only, not authority)");
+        }
+        LanternAction::Validate { path } => {
+            let raw = if path == "-" {
+                use std::io::Read;
+                let mut s = String::new();
+                std::io::stdin().read_to_string(&mut s)?;
+                s
+            } else {
+                std::fs::read_to_string(path)?
+            };
+            let value: serde_json::Value = serde_json::from_str(&raw)?;
+            let errs = lantern::validate(&value);
+            if errs.is_empty() {
+                println!("valid");
+            } else {
+                println!("invalid:");
+                for e in &errs {
+                    println!("  - {e}");
+                }
+                std::process::exit(1);
+            }
+        }
+    }
     Ok(())
 }
 

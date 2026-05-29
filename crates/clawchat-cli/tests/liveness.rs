@@ -1,7 +1,6 @@
-//! Exercises the `wait` liveness escape hatches end-to-end by running the real
-//! `clawchat` binary against an in-process server and asserting its exit code:
-//!   2 = idle-timeout expired, 3 = peer ended the conversation.
-//! These are the contract a reply-then-wait loop relies on to avoid hanging.
+//! End-to-end CLI tests against an in-process server: the `wait` liveness
+//! escape hatches (exit 2 = idle-timeout, 3 = peer ended), the missing-message
+//! cursor/drain fix, and the LANTERN overlay flow + reconstruction.
 
 use clawchat_client::ClawChatClient;
 use clawchat_server::{ClawChatServer, ServerConfig};
@@ -104,4 +103,156 @@ async fn wait_conversation_end_exits_3() {
         Some(3),
         "a conversation_end message must make wait exit with code 3"
     );
+}
+
+/// The cursor file advances only to messages actually read, never to the
+/// agent's own sent seq — so a correction that lands while it "composes" is
+/// delivered on the next identical wait, not skipped (the missing-message race).
+#[tokio::test]
+async fn wait_cursor_file_does_not_skip_unread() {
+    let (_handle, addr, key, tmp) = start_test_server().await;
+    let cursor = tmp.path().join("cursor");
+    let cursor_arg = cursor.to_str().unwrap();
+
+    let speaker = ClawChatClient::connect_tcp(&addr, &key, "speaker", None, vec![])
+        .await
+        .unwrap();
+    speaker.join_room("lobby").await.unwrap();
+    speaker.send_message("lobby", "m1", None, vec![]).await.unwrap();
+
+    // Turn 1: read m1; the cursor seeds from --since-seq 0 and advances to m1.
+    let out = Command::new(env!("CARGO_BIN_EXE_clawchat"))
+        .args([
+            "--tcp", &addr, "--key", &key, "--name", "waiter", "wait", "lobby", "--loop",
+            "--cursor-file", cursor_arg, "--since-seq", "0", "--idle-timeout", "5",
+            "--heartbeat-secs", "0",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "turn 1 should read m1");
+    let m1_seq = std::fs::read_to_string(&cursor).unwrap().trim().to_string();
+
+    // Race: a correction lands, then the waiter's OWN reply advances the room tip
+    // past it. A `--since-seq tip` loop would now skip the correction.
+    speaker.send_message("lobby", "correction", None, vec![]).await.unwrap();
+    let waiter_send = ClawChatClient::connect_tcp(&addr, &key, "waiter", None, vec![])
+        .await
+        .unwrap();
+    waiter_send.join_room("lobby").await.unwrap();
+    waiter_send.send_message("lobby", "my reply", None, vec![]).await.unwrap();
+
+    // Turn 2: the identical command. Floor is the cursor (m1), so the correction
+    // is delivered (exit 0) and the cursor advances past it — never skipped.
+    let out = Command::new(env!("CARGO_BIN_EXE_clawchat"))
+        .args([
+            "--tcp", &addr, "--key", &key, "--name", "waiter", "wait", "lobby", "--loop",
+            "--cursor-file", cursor_arg, "--idle-timeout", "5", "--heartbeat-secs", "0",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "turn 2 must deliver the correction, not time out (the skip bug)"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("correction"), "turn 2 should return the correction, got: {stdout}");
+    let new_seq = std::fs::read_to_string(&cursor).unwrap().trim().to_string();
+    assert_ne!(new_seq, m1_seq, "cursor must advance past m1 to the correction");
+}
+
+/// `--drain` returns every unread message through the tip in one wait, so a
+/// burst that arrived together is processed in a single turn.
+#[tokio::test]
+async fn wait_drain_returns_full_batch() {
+    let (_handle, addr, key, tmp) = start_test_server().await;
+    let cursor = tmp.path().join("cursor");
+
+    let speaker = ClawChatClient::connect_tcp(&addr, &key, "speaker", None, vec![])
+        .await
+        .unwrap();
+    speaker.join_room("lobby").await.unwrap();
+    speaker.send_message("lobby", "batch-1", None, vec![]).await.unwrap();
+    speaker.send_message("lobby", "batch-2", None, vec![]).await.unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_clawchat"))
+        .args([
+            "--tcp", &addr, "--key", &key, "--name", "waiter", "wait", "lobby", "--loop", "--drain",
+            "--cursor-file", cursor.to_str().unwrap(), "--since-seq", "0", "--idle-timeout", "5",
+            "--heartbeat-secs", "0",
+        ])
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("batch-1") && stdout.contains("batch-2"), "drain must emit both, got: {stdout}");
+    assert_eq!(stdout.trim().lines().count(), 2, "drain should emit one line per message");
+}
+
+/// Drive a full LANTERN thread through the real binary (ASSERT → CHALLENGE →
+/// RESOLVE → FUSE), then confirm the read side reconstructs the fused thread and
+/// scores both agents' staked claims.
+#[tokio::test]
+async fn lantern_flow_reconstructs_and_scores() {
+    let (_handle, addr, key, _tmp) = start_test_server().await;
+    let bin = env!("CARGO_BIN_EXE_clawchat");
+    let run = |name: &'static str, extra: Vec<String>| {
+        let addr = addr.clone();
+        let key = key.clone();
+        async move {
+            let mut args = vec![
+                "--tcp".to_string(), addr, "--key".to_string(), key,
+                "--name".to_string(), name.to_string(), "lantern".to_string(),
+            ];
+            args.extend(extra);
+            Command::new(bin).args(&args).output().await.unwrap()
+        }
+    };
+
+    // ASSERT opens a thread; its seq is the thread id.
+    let out = run("aye", vec![
+        "assert".into(), "lobby".into(), "--claim".into(), "missing rollback gate".into(),
+        "--falsifiable-by".into(), "a documented operator rollback".into(), "--confidence".into(), "0.8".into(),
+    ]).await;
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let aseq: i64 = stdout.split("seq ").nth(1).and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok()).expect("assert should print its seq");
+
+    // CHALLENGE from the other agent.
+    let out = run("bee", vec![
+        "challenge".into(), "lobby".into(), "--thread".into(), aseq.to_string(),
+        "--target-seq".into(), aseq.to_string(), "--counter-claim".into(), "exists as recovery".into(),
+        "--confidence".into(), "0.6".into(), "--test".into(), "grep plan".into(),
+    ]).await;
+    assert_eq!(out.status.code(), Some(0));
+    let cstdout = String::from_utf8_lossy(&out.stdout);
+    let cseq: i64 = cstdout.split("seq ").nth(1).and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse().ok()).unwrap();
+
+    // RESOLVE (scorable basis) + FUSE with calibration outcomes.
+    let out = run("aye", vec![
+        "resolve".into(), "lobby".into(), "--thread".into(), aseq.to_string(),
+        "--observation".into(), "no operator rollback gate".into(), "--basis".into(), "artifact".into(),
+    ]).await;
+    assert_eq!(out.status.code(), Some(0));
+    let out = run("aye", vec![
+        "fuse".into(), "lobby".into(), "--thread".into(), aseq.to_string(),
+        "--synthesis".into(), "add the gate".into(),
+        "--outcome".into(), format!("{aseq}=true"), "--outcome".into(), format!("{cseq}=false"),
+    ]).await;
+    assert_eq!(out.status.code(), Some(0));
+
+    // Reconstruction: the thread is fused.
+    let out = run("aye", vec!["threads".into(), "lobby".into()]).await;
+    let threads = String::from_utf8_lossy(&out.stdout);
+    assert!(threads.contains("fused"), "thread should be fused, got: {threads}");
+
+    // Calibration scores both agents (aye's assert held, bee's challenge missed).
+    let out = run("aye", vec!["calibration".into(), "lobby".into()]).await;
+    let cal = String::from_utf8_lossy(&out.stdout);
+    assert!(cal.contains("aye") && cal.contains("bee"), "both agents scored, got: {cal}");
 }

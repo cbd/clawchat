@@ -288,6 +288,30 @@ impl Store {
         Ok(affected > 0)
     }
 
+    /// Delete persisted messages older than `age_modifier` (a SQLite datetime
+    /// modifier such as "-14 days") in rooms whose owning key has tier `tier`.
+    /// Rooms with no/unknown owner key are treated as 'free'. The cutoff is
+    /// computed with the same `strftime` format the `created_at` default uses,
+    /// so the comparison is an exact lexicographic match. Returns rows deleted.
+    pub fn purge_messages_by_tier(
+        &self,
+        tier: &str,
+        age_modifier: &str,
+    ) -> Result<usize, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let affected = conn.execute(
+            "DELETE FROM messages WHERE message_id IN (
+                SELECT m.message_id FROM messages m
+                JOIN rooms r ON m.room_id = r.room_id
+                LEFT JOIN api_keys k ON r.owner_key = k.api_key
+                WHERE COALESCE(k.tier, 'free') = ?1
+                  AND m.created_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?2)
+            )",
+            params![tier, age_modifier],
+        )?;
+        Ok(affected)
+    }
+
     // --- Message operations ---
 
     pub fn insert_message(
@@ -1362,5 +1386,27 @@ mod tests {
 
         let all = store.list_rooms(None).unwrap();
         assert!(all.len() >= 4); // lobby + parent + 2 children
+    }
+
+    #[test]
+    fn test_purge_messages_by_tier() {
+        let store = Store::open_in_memory().unwrap();
+        // A room with no owner key resolves to the 'free' tier via COALESCE.
+        store
+            .create_room("r1", "purge-room", None, None, None)
+            .unwrap();
+        store
+            .insert_message("m1", "r1", "a1", "agent", "hello", None, &serde_json::json!({}))
+            .unwrap();
+
+        // A freshly-inserted message is inside the 14-day free window — kept.
+        assert_eq!(store.purge_messages_by_tier("free", "-14 days").unwrap(), 0);
+        // A pro sweep must not touch a free room, even with a future cutoff.
+        assert_eq!(store.purge_messages_by_tier("pro", "+1 hours").unwrap(), 0);
+        assert_eq!(store.get_history("r1", 10, None).unwrap().len(), 1);
+
+        // Once the cutoff moves past the message, the free sweep deletes it.
+        assert_eq!(store.purge_messages_by_tier("free", "+1 hours").unwrap(), 1);
+        assert_eq!(store.get_history("r1", 10, None).unwrap().len(), 0);
     }
 }

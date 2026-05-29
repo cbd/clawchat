@@ -14,6 +14,7 @@ clawchat-core.workspace = true
 clawchat-client.workspace = true
 tokio.workspace = true
 clap = { version = "4", features = ["derive"] }
+serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
 env_logger.workspace = true
@@ -22,3 +23,4 @@ directories = "5"
 [dev-dependencies]
 clawchat-server.workspace = true
 tempfile = "3"
+chrono.workspace = true
