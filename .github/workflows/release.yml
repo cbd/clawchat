@@ -1,0 +1,122 @@
+name: Release
+
+# On a version tag (v*), build prebuilt clawchat + clawchat-server binaries for
+# macOS (arm64/x86_64) and Linux (arm64/x86_64) on native runners, attach them to
+# the GitHub release, and bump the Homebrew formula in cbd/homebrew-tap.
+# Can also be run manually against an existing tag via workflow_dispatch.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and release, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            target: aarch64-apple-darwin
+          # Intel-mac target is cross-built on an Apple Silicon runner — GitHub
+          # is retiring the macos-13 (Intel) runners.
+          - runner: macos-14
+            target: x86_64-apple-darwin
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --release --locked --target ${{ matrix.target }} -p clawchat-cli -p clawchat-server
+      - name: Package tarball
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          tar -czf "clawchat-${TAG}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" clawchat clawchat-server
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clawchat-${{ matrix.target }}
+          path: clawchat-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the workflow's own ref (default branch on dispatch, the tag on
+      # a tag push) — we need the formula template here, which is repo tooling,
+      # not part of the tagged source.
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release + bump Homebrew formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          REPO="${{ github.repository }}"
+          BASE="https://github.com/${REPO}/releases/download/${TAG}"
+
+          sha() { shasum -a 256 "dist/clawchat-${TAG}-$1.tar.gz" | awk '{print $1}'; }
+          MAC_ARM=$(sha aarch64-apple-darwin)
+          MAC_X86=$(sha x86_64-apple-darwin)
+          LIN_ARM=$(sha aarch64-unknown-linux-gnu)
+          LIN_X86=$(sha x86_64-unknown-linux-gnu)
+
+          # Create the release if missing, else replace its assets.
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/clawchat-*.tar.gz --repo "$REPO" --clobber
+          else
+            gh release create "$TAG" dist/clawchat-*.tar.gz --repo "$REPO" \
+              --title "ClawChat $TAG" \
+              --notes "Prebuilt clawchat + clawchat-server binaries (macOS arm64/x86_64, Linux arm64/x86_64). Install: \`brew install cbd/tap/clawchat\`."
+          fi
+
+          # Render the formula from the template.
+          sed \
+            -e "s|@VERSION@|${VERSION}|g" \
+            -e "s|@TAG@|${TAG}|g" \
+            -e "s|@BASE@|${BASE}|g" \
+            -e "s|@MAC_ARM@|${MAC_ARM}|g" \
+            -e "s|@MAC_X86@|${MAC_X86}|g" \
+            -e "s|@LIN_ARM@|${LIN_ARM}|g" \
+            -e "s|@LIN_X86@|${LIN_X86}|g" \
+            .github/clawchat-formula.rb.tmpl > /tmp/clawchat.rb
+
+          # Push the bumped formula to the tap via the deploy key.
+          mkdir -p ~/.ssh && chmod 700 ~/.ssh
+          printf '%s\n' "$TAP_DEPLOY_KEY" > ~/.ssh/id_tap && chmod 600 ~/.ssh/id_tap
+          ssh-keyscan -t ed25519 github.com >> ~/.ssh/known_hosts 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/id_tap -o IdentitiesOnly=yes"
+          git clone git@github.com:cbd/homebrew-tap.git tap
+          cp /tmp/clawchat.rb tap/Formula/clawchat.rb
+          cd tap
+          git config user.name "clawchat-release-bot"
+          git config user.email "release-bot@clawchat.live"
+          git add Formula/clawchat.rb
+          if git diff --cached --quiet; then
+            echo "Formula unchanged."
+          else
+            git commit -m "clawchat ${VERSION}"
+            git push
+          fi

@@ -1,0 +1,19 @@
+/target
+**/*.rs.bk
+*.swp
+*.swo
+.DS_Store
+__pycache__/
+*.pyc
+
+# Local agent/editor config and secrets
+.claude/
+.env
+.env.*
+
+# Runtime data
+*.db
+*.db-wal
+*.db-shm
+clawchat.sock
+auth.key

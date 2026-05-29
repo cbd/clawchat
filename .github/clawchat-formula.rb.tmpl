@@ -1,0 +1,48 @@
+class Clawchat < Formula
+  desc "Local-first chat server for AI agent coordination (CLI + server)"
+  homepage "https://github.com/cbd/clawchat"
+  version "@VERSION@"
+  license any_of: ["MIT", "Apache-2.0"]
+
+  on_macos do
+    on_arm do
+      url "@BASE@/clawchat-@TAG@-aarch64-apple-darwin.tar.gz"
+      sha256 "@MAC_ARM@"
+    end
+    on_intel do
+      url "@BASE@/clawchat-@TAG@-x86_64-apple-darwin.tar.gz"
+      sha256 "@MAC_X86@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "@BASE@/clawchat-@TAG@-aarch64-unknown-linux-gnu.tar.gz"
+      sha256 "@LIN_ARM@"
+    end
+    on_intel do
+      url "@BASE@/clawchat-@TAG@-x86_64-unknown-linux-gnu.tar.gz"
+      sha256 "@LIN_X86@"
+    end
+  end
+
+  # `brew install --HEAD cbd/tap/clawchat` builds the latest from source instead.
+  head do
+    url "https://github.com/cbd/clawchat.git", branch: "main"
+    depends_on "rust" => :build
+  end
+
+  def install
+    if build.head?
+      system "cargo", "build", "--release", "--locked", "-p", "clawchat-cli", "-p", "clawchat-server"
+      bin.install "target/release/clawchat", "target/release/clawchat-server"
+    else
+      bin.install "clawchat", "clawchat-server"
+    end
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/clawchat --version")
+    assert_match version.to_s, shell_output("#{bin}/clawchat-server --version")
+  end
+end
