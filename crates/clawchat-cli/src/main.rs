@@ -248,11 +248,12 @@ enum Commands {
         /// to the room's current tip on start.
         #[arg(long)]
         since_seq: Option<String>,
-        /// Stay in wait indefinitely: re-poll on internal timeout (tracking the
-        /// bookmark) until a real chat message arrives. Pairs with --since-seq
-        /// so messages that land between iterations are never missed. With this
-        /// flag the single CLI invocation replaces the "re-run wait on timeout"
-        /// discipline — the agent makes one call and gets one message back.
+        /// Stay in wait indefinitely: re-poll on internal timeout and reconnect
+        /// transport failures with bounded backoff (tracking the bookmark) until
+        /// a real chat message arrives. Pairs with --since-seq so messages that
+        /// land between iterations are never missed. With this flag the single
+        /// CLI invocation replaces the "re-run wait on timeout" discipline — the
+        /// agent makes one call and gets one message back.
         #[arg(long = "loop")]
         loop_: bool,
         /// Keep streaming messages until interrupted or a conversation_end is
@@ -799,6 +800,93 @@ fn advance_cursor(
     }
     *cursor = Some(seq);
     Ok(())
+}
+
+fn is_retryable_wait_error(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Io(_)
+            | ClientError::ConnectionClosed
+            | ClientError::Timeout
+            | ClientError::Channel
+            | ClientError::Ws(_)
+    )
+}
+
+fn spawn_wait_presence_watcher(
+    client: &ClawChatClient,
+    room_id: &str,
+    enabled: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !enabled {
+        return None;
+    }
+    let mut events = client.subscribe();
+    let room_label = room_id.to_string();
+    Some(tokio::spawn(async move {
+        while let Ok(evt) = events.recv().await {
+            let in_room = evt.frame.payload.get("room_id").and_then(|v| v.as_str())
+                == Some(room_label.as_str());
+            if !in_room {
+                continue;
+            }
+            match evt.frame.frame_type {
+                FrameType::AgentJoined => {
+                    let name = evt
+                        .frame
+                        .payload
+                        .get("agent")
+                        .and_then(|a| a.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    eprintln!("wait: peer {} joined", name);
+                }
+                FrameType::AgentLeft => {
+                    let who = evt
+                        .frame
+                        .payload
+                        .get("agent_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    eprintln!("wait: peer {} left", who);
+                }
+                _ => {}
+            }
+        }
+    }))
+}
+
+fn spawn_wait_thinking_watcher(
+    client: &ClawChatClient,
+    room_id: &str,
+    self_name: &str,
+    secret: Option<Vec<u8>>,
+    enabled: bool,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if !enabled {
+        return None;
+    }
+    let mut events = client.subscribe();
+    let room_label = room_id.to_string();
+    let self_name = self_name.to_string();
+    Some(tokio::spawn(async move {
+        while let Ok(evt) = events.recv().await {
+            if evt.frame.frame_type != FrameType::Thinking {
+                continue;
+            }
+            let p = &evt.frame.payload;
+            if p.get("room_id").and_then(|v| v.as_str()) != Some(room_label.as_str()) {
+                continue;
+            }
+            let name = p.get("agent_name").and_then(|v| v.as_str()).unwrap_or("?");
+            if name == self_name {
+                continue;
+            }
+            let content = p.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            let content = decrypt_field(secret.as_deref(), &room_label, content);
+            eprintln!("wait: thinking {}: {}", name, content);
+        }
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1593,8 +1681,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
                 return Ok(());
             }
-            let client = connect(&cli).await?;
-            let room_id = resolve_room_id(&client, room).await?;
+            let mut client = connect(&cli).await?;
+            let mut room_id = resolve_room_id(&client, room).await?;
             let _ = client.join_room(&room_id).await;
 
             // A cursor file, when present, is the source of truth for the read
@@ -1667,74 +1755,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // side arrive and know to keep waiting instead of concluding "gone".
             // Uses its own event subscription, independent of the SDK wait loop.
             // Gated by the same quiet switch as heartbeats.
-            let presence_task = if *heartbeat_secs > 0 {
-                let mut events = client.subscribe();
-                let room_label = room_id.clone();
-                Some(tokio::spawn(async move {
-                    while let Ok(evt) = events.recv().await {
-                        let in_room = evt.frame.payload.get("room_id").and_then(|v| v.as_str())
-                            == Some(room_label.as_str());
-                        if !in_room {
-                            continue;
-                        }
-                        match evt.frame.frame_type {
-                            FrameType::AgentJoined => {
-                                let name = evt
-                                    .frame
-                                    .payload
-                                    .get("agent")
-                                    .and_then(|a| a.get("name"))
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                eprintln!("wait: peer {} joined", name);
-                            }
-                            FrameType::AgentLeft => {
-                                let who = evt
-                                    .frame
-                                    .payload
-                                    .get("agent_id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("?");
-                                eprintln!("wait: peer {} left", who);
-                            }
-                            _ => {}
-                        }
-                    }
-                }))
-            } else {
-                None
-            };
+            let mut presence_task =
+                spawn_wait_presence_watcher(&client, &room_id, *heartbeat_secs > 0);
 
             // Thinking-watcher task: with --show-thinking, print peers' thinking
             // pulses to stderr for live visibility, WITHOUT waking the wait (it
             // still only returns on a real chat message). Own pulses are skipped;
             // content is decrypted if a room key is configured.
-            let thinking_task = if *show_thinking {
-                let mut events = client.subscribe();
-                let room_label = room_id.clone();
-                let self_name = cli.name.clone();
-                let secret = resolve_room_secret(&cli);
-                Some(tokio::spawn(async move {
-                    while let Ok(evt) = events.recv().await {
-                        if evt.frame.frame_type != FrameType::Thinking {
-                            continue;
-                        }
-                        let p = &evt.frame.payload;
-                        if p.get("room_id").and_then(|v| v.as_str()) != Some(room_label.as_str()) {
-                            continue;
-                        }
-                        let name = p.get("agent_name").and_then(|v| v.as_str()).unwrap_or("?");
-                        if name == self_name {
-                            continue; // don't echo our own pulses
-                        }
-                        let content = p.get("content").and_then(|v| v.as_str()).unwrap_or("");
-                        let content = decrypt_field(secret.as_deref(), &room_label, content);
-                        eprintln!("wait: thinking {}: {}", name, content);
-                    }
-                }))
-            } else {
-                None
-            };
+            let room_secret = resolve_room_secret(&cli);
+            let mut thinking_task = spawn_wait_thinking_watcher(
+                &client,
+                &room_id,
+                &cli.name,
+                room_secret.clone(),
+                *show_thinking,
+            );
 
             // Helper closure: does a candidate message match all filters?
             let matches = |msg: &ChatMessage| -> bool {
@@ -1769,19 +1804,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::sync::atomic::AtomicI64::new(resolved_since_seq.unwrap_or(i64::MIN));
             let wait_loop = async {
                 let mut cursor = resolved_since_seq;
+                let mut backoff = 1u64;
                 loop {
-                    let result: Result<Option<ChatMessage>, _> = if *loop_ {
-                        client
-                            .wait_for_message_loop(&room_id, effective_timeout, cursor)
-                            .await
-                            .map(Some)
-                    } else {
-                        client
-                            .wait_for_message(&room_id, effective_timeout, cursor)
-                            .await
-                    };
+                    let result = client
+                        .wait_for_message(&room_id, effective_timeout, cursor)
+                        .await;
                     match result {
                         Ok(Some(msg)) => {
+                            backoff = 1;
                             if matches(&msg) {
                                 break Ok(Some(msg));
                             }
@@ -1794,7 +1824,76 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             cursor = Some(msg.seq);
                             latest_seq.store(msg.seq, std::sync::atomic::Ordering::Relaxed);
                         }
-                        other => break other,
+                        Ok(None) if *loop_ => continue,
+                        Ok(None) => break Ok(None),
+                        Err(error) if *loop_ && is_retryable_wait_error(&error) => {
+                            eprintln!(
+                                "wait --loop: connection lost: {error}; retrying in {backoff}s"
+                            );
+                            if let Some(task) = presence_task.take() {
+                                task.abort();
+                            }
+                            if let Some(task) = thinking_task.take() {
+                                task.abort();
+                            }
+
+                            loop {
+                                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                                let replacement = match connect(&cli).await {
+                                    Ok(replacement) => replacement,
+                                    Err(reconnect_error) => {
+                                        eprintln!(
+                                            "wait --loop: reconnect failed: {reconnect_error}; retrying in {}s",
+                                            (backoff * 2).min(30)
+                                        );
+                                        backoff = (backoff * 2).min(30);
+                                        continue;
+                                    }
+                                };
+                                let replacement_room_id = match resolve_room_id(&replacement, room)
+                                    .await
+                                {
+                                    Ok(id) => id,
+                                    Err(reconnect_error) => {
+                                        eprintln!(
+                                            "wait --loop: room lookup failed: {reconnect_error}; retrying in {}s",
+                                            (backoff * 2).min(30)
+                                        );
+                                        backoff = (backoff * 2).min(30);
+                                        continue;
+                                    }
+                                };
+                                if let Err(reconnect_error) =
+                                    replacement.join_room(&replacement_room_id).await
+                                {
+                                    eprintln!(
+                                        "wait --loop: join failed: {reconnect_error}; retrying in {}s",
+                                        (backoff * 2).min(30)
+                                    );
+                                    backoff = (backoff * 2).min(30);
+                                    continue;
+                                }
+
+                                client = replacement;
+                                room_id = replacement_room_id;
+                                let _ = client.set_presence("waiting", None, None).await;
+                                presence_task = spawn_wait_presence_watcher(
+                                    &client,
+                                    &room_id,
+                                    *heartbeat_secs > 0,
+                                );
+                                thinking_task = spawn_wait_thinking_watcher(
+                                    &client,
+                                    &room_id,
+                                    &cli.name,
+                                    room_secret.clone(),
+                                    *show_thinking,
+                                );
+                                backoff = 1;
+                                break;
+                            }
+                        }
+                        Err(error) => break Err(error),
                     }
                 }
             };
@@ -1820,10 +1919,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(task) = heartbeat_task {
                 task.abort();
             }
-            if let Some(task) = presence_task {
+            if let Some(task) = presence_task.take() {
                 task.abort();
             }
-            if let Some(task) = thinking_task {
+            if let Some(task) = thinking_task.take() {
                 task.abort();
             }
 

@@ -38,8 +38,15 @@ clawchat --name me history <room>                       # catch up
 ```
 
 Always pass a consistent `--name` and `--agent-id`. Use `wait --follow` for a
-durable multi-message listener; `wait --loop` retries timeouts but deliberately
-returns after the first matching message.
+durable multi-message listener; `wait --loop` retries timeouts and transport
+disconnects with bounded backoff but deliberately returns after the first
+matching message.
+
+For Codex, distinguish observation from session-affecting polling: a detached
+shell or `tmux` waiter can log messages but cannot wake an idle Codex task. If
+room traffic must continue the current task, attach a recurring heartbeat to
+that task that reads and acts on new room messages. Do not describe a log-only
+poller as affecting the Codex session.
 
 ## Full reference
 

@@ -4,7 +4,12 @@
 
 use clawchat_client::ClawChatClient;
 use clawchat_server::{ClawChatServer, ServerConfig};
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
+use tokio::io::copy_bidirectional;
 use tokio::process::Command;
 use tokio::time::sleep;
 
@@ -40,6 +45,102 @@ async fn start_test_server() -> (
     });
     sleep(Duration::from_millis(100)).await;
     (handle, tcp_addr, api_key, tmp_dir)
+}
+
+/// TCP proxy that deliberately drops its first accepted connection, then
+/// transparently forwards every reconnect to the real server.
+async fn start_drop_once_proxy(
+    upstream: String,
+) -> (tokio::task::JoinHandle<()>, String, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let observed = connections.clone();
+    let handle = tokio::spawn(async move {
+        loop {
+            let (mut downstream, _) = listener.accept().await.unwrap();
+            let mut upstream_stream = tokio::net::TcpStream::connect(&upstream).await.unwrap();
+            let attempt = observed.fetch_add(1, Ordering::SeqCst);
+            tokio::spawn(async move {
+                if attempt == 0 {
+                    tokio::select! {
+                        _ = sleep(Duration::from_millis(500)) => {}
+                        _ = copy_bidirectional(&mut downstream, &mut upstream_stream) => {}
+                    }
+                    return;
+                }
+                let _ = copy_bidirectional(&mut downstream, &mut upstream_stream).await;
+            });
+        }
+    });
+    (handle, addr, connections)
+}
+
+/// `wait --loop` must reconnect after a transport dies instead of surfacing
+/// the request timeout as exit 1. A message sent after reconnection still wakes
+/// the original CLI process.
+#[tokio::test]
+async fn wait_loop_reconnects_after_transport_disconnect() {
+    let (_server, server_addr, key, _tmp) = start_test_server().await;
+    let (_proxy, proxy_addr, connections) = start_drop_once_proxy(server_addr.clone()).await;
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_clawchat"))
+        .args([
+            "--tcp",
+            &proxy_addr,
+            "--key",
+            &key,
+            "--name",
+            "waiter",
+            "--agent-id",
+            "stable-waiter",
+            "wait",
+            "lobby",
+            "--loop",
+            "--timeout",
+            "1",
+            "--since-seq",
+            "tip",
+            "--idle-timeout",
+            "20",
+            "--heartbeat-secs",
+            "0",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let reconnected = tokio::time::timeout(Duration::from_secs(15), async {
+        while connections.load(Ordering::SeqCst) < 2 {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    if reconnected.is_err() {
+        let status = child.try_wait().unwrap();
+        let _ = child.kill().await;
+        panic!("wait --loop did not reconnect; child status: {status:?}");
+    }
+
+    let speaker = ClawChatClient::connect_tcp(&server_addr, &key, "speaker", None, vec![])
+        .await
+        .unwrap();
+    speaker.join_room("lobby").await.unwrap();
+    speaker
+        .send_message("lobby", "after reconnect", None, vec![])
+        .await
+        .unwrap();
+
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("reconnected waiter should receive the message")
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("after reconnect"),
+        "waiter should print the post-reconnect message"
+    );
 }
 
 /// A `wait --loop` on a silent room exits 2 once the idle deadline passes,
