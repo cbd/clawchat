@@ -31,7 +31,7 @@ async fn start_test_server() -> (
         http_signup_enabled: false,
         http_admin_secret: None,
         http_allowed_origins: vec![],
-        trust_forwarded_for: false,
+        trusted_proxy_ips: vec![],
     };
     let server = ClawChatServer::new(config).unwrap();
     let api_key = server.api_key().to_string();

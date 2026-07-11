@@ -1,7 +1,7 @@
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, State,
+        ConnectInfo, Path, State,
     },
     http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::IntoResponse,
@@ -13,6 +13,7 @@ use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use rust_embed::Embed;
 use std::sync::Arc;
+use std::{net::IpAddr, net::SocketAddr};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use crate::broker::Broker;
@@ -43,7 +44,7 @@ pub struct AppState {
     pub signup_enabled: bool,
     pub admin_secret: Option<String>,
     pub allowed_origins: Vec<String>,
-    pub trust_forwarded_for: bool,
+    pub trusted_proxy_ips: Vec<IpAddr>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -196,6 +197,7 @@ async fn handle_ws_connection(ws: WebSocket, state: AppState) {
 
 async fn create_api_key(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> impl IntoResponse {
@@ -214,7 +216,7 @@ async fn create_api_key(
             Json(serde_json::json!({"error": "admin secret required"})),
         );
     }
-    let client_ip = signup_bucket(&headers, state.trust_forwarded_for);
+    let client_ip = signup_bucket(peer, &headers, &state.trusted_proxy_ips);
     if !state.rate_limiter.try_register_signup(&client_ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -244,17 +246,18 @@ async fn create_api_key(
     )
 }
 
-fn signup_bucket(headers: &HeaderMap, trust_forwarded_for: bool) -> String {
-    if trust_forwarded_for {
+fn signup_bucket(peer: SocketAddr, headers: &HeaderMap, trusted_proxies: &[IpAddr]) -> String {
+    if trusted_proxies.contains(&peer.ip()) {
         if let Some(value) = headers
             .get("x-forwarded-for")
             .and_then(|value| value.to_str().ok())
             .and_then(|value| value.rsplit(',').next())
+            .and_then(|value| value.trim().parse::<IpAddr>().ok())
         {
-            return value.trim().to_string();
+            return value.to_string();
         }
     }
-    "direct".to_string()
+    peer.ip().to_string()
 }
 
 async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
@@ -403,7 +406,7 @@ mod tests {
             signup_enabled: false,
             admin_secret: None,
             allowed_origins: vec![],
-            trust_forwarded_for: false,
+            trusted_proxy_ips: vec![],
         }
     }
 
@@ -422,19 +425,31 @@ mod tests {
     }
 
     #[test]
-    fn forged_forwarded_for_is_ignored_without_trusted_proxy_mode() {
+    fn peer_ip_is_default_and_xff_requires_an_explicit_trusted_proxy() {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::HeaderName::from_static("x-forwarded-for"),
             HeaderValue::from_static("203.0.113.10, 198.51.100.20"),
         );
-        assert_eq!(signup_bucket(&headers, false), "direct");
-        assert_eq!(signup_bucket(&headers, true), "198.51.100.20");
+        let direct_a: SocketAddr = "192.0.2.10:1111".parse().unwrap();
+        let direct_b: SocketAddr = "192.0.2.11:2222".parse().unwrap();
+        assert_eq!(signup_bucket(direct_a, &headers, &[]), "192.0.2.10");
+        assert_eq!(signup_bucket(direct_b, &headers, &[]), "192.0.2.11");
+        assert_eq!(
+            signup_bucket(direct_a, &headers, &["192.0.2.99".parse().unwrap()]),
+            "192.0.2.10",
+            "an untrusted direct peer must not spoof XFF even when proxies are configured"
+        );
+        assert_eq!(
+            signup_bucket(direct_a, &headers, &[direct_a.ip()]),
+            "198.51.100.20"
+        );
     }
 
     #[tokio::test]
     async fn signup_requires_explicit_mode_and_admin_secret() {
-        let disabled = create_api_key(State(test_state()), HeaderMap::new(), None)
+        let peer = ConnectInfo("127.0.0.1:1234".parse().unwrap());
+        let disabled = create_api_key(State(test_state()), peer, HeaderMap::new(), None)
             .await
             .into_response();
         assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
@@ -442,7 +457,7 @@ mod tests {
         let mut enabled = test_state();
         enabled.signup_enabled = true;
         enabled.admin_secret = Some("admin-secret".into());
-        let missing = create_api_key(State(enabled.clone()), HeaderMap::new(), None)
+        let missing = create_api_key(State(enabled.clone()), peer, HeaderMap::new(), None)
             .await
             .into_response();
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
@@ -451,7 +466,7 @@ mod tests {
             header::HeaderName::from_static("x-clawchat-admin"),
             HeaderValue::from_static("admin-secret"),
         );
-        let created = create_api_key(State(enabled), headers, None)
+        let created = create_api_key(State(enabled), peer, headers, None)
             .await
             .into_response();
         assert_eq!(created.status(), StatusCode::CREATED);

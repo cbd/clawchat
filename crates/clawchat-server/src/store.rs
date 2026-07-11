@@ -24,9 +24,23 @@ pub struct VoteMeta {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
-        let conn = Connection::open(path)?;
+        crate::auth::harden_parent_directory(path)
+            .map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        drop(
+            options
+                .open(path)
+                .map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?,
+        );
         crate::auth::harden_file_permissions(path)
             .map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
+        let conn = Connection::open(path)?;
         let store = Self {
             conn: Mutex::new(conn),
         };
@@ -276,7 +290,11 @@ impl Store {
              JOIN votes v ON v.vote_id = b.vote_id WHERE v.status = 'open';
              UPDATE votes SET eligible_voters = (
                  SELECT COUNT(*) FROM vote_eligible_agents e WHERE e.vote_id = votes.vote_id
-             ) WHERE status = 'open';",
+             ) WHERE status = 'open';
+             UPDATE votes SET status = 'closed'
+             WHERE status = 'open' AND eligible_voters > 0
+               AND (SELECT COUNT(*) FROM vote_ballots b WHERE b.vote_id = votes.vote_id)
+                   >= eligible_voters;",
         )?;
 
         Ok(())
@@ -1807,6 +1825,35 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert!(store.claim_agent_identity("stable-agent", "key-a").unwrap());
         assert!(!store.claim_agent_identity("stable-agent", "key-b").unwrap());
+    }
+
+    #[test]
+    fn test_legacy_reconstructed_vote_that_is_already_complete_closes_on_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy-vote.db");
+        {
+            let store = Store::open(&path).unwrap();
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO votes
+                 (vote_id, room_id, title, options, created_by, status, eligible_voters)
+                 VALUES ('legacy-vote', 'lobby', 'Legacy', '[\"yes\",\"no\"]',
+                         'legacy-creator', 'open', 2)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO vote_ballots
+                 (vote_id, agent_id, agent_name, option_index)
+                 VALUES ('legacy-vote', 'legacy-creator', 'Creator', 0)",
+                [],
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        let vote = store.get_vote_meta("legacy-vote").unwrap().unwrap();
+        assert_eq!(vote.eligible_voters, 1);
+        assert_eq!(vote.status, "closed");
     }
 
     #[test]

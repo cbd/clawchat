@@ -41,9 +41,9 @@ enum Commands {
         #[arg(long = "http-origin")]
         http_origins: Vec<String>,
 
-        /// Trust the final X-Forwarded-For hop for signup throttling.
-        #[arg(long)]
-        trust_forwarded_for: bool,
+        /// Proxy IP allowed to supply the final X-Forwarded-For hop. Repeatable.
+        #[arg(long = "trusted-proxy")]
+        trusted_proxy_ips: Vec<std::net::IpAddr>,
 
         /// Disable API key validation (open access, for local dev)
         #[arg(long)]
@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             enable_http_signup,
             http_admin_secret,
             http_origins,
-            trust_forwarded_for,
+            trusted_proxy_ips,
             no_auth,
             db,
             key_file,
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 http_signup_enabled: enable_http_signup,
                 http_admin_secret,
                 http_allowed_origins: http_origins,
-                trust_forwarded_for,
+                trusted_proxy_ips,
             };
 
             let server = ClawChatServer::new(config)?;

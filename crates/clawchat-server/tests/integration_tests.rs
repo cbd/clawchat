@@ -33,7 +33,7 @@ async fn start_test_server() -> (
         http_signup_enabled: false,
         http_admin_secret: None,
         http_allowed_origins: vec![],
-        trust_forwarded_for: false,
+        trusted_proxy_ips: vec![],
     };
 
     let server = ClawChatServer::new(config).unwrap();
@@ -816,7 +816,7 @@ async fn test_open_vote_and_ballots_survive_server_restart() {
         http_signup_enabled: false,
         http_admin_secret: None,
         http_allowed_origins: vec![],
-        trust_forwarded_for: false,
+        trusted_proxy_ips: vec![],
     })
     .unwrap();
     let restarted_handle = tokio::spawn(async move {
@@ -2745,7 +2745,7 @@ async fn test_agent_id_ownership_survives_server_restart() {
         http_signup_enabled: false,
         http_admin_secret: None,
         http_allowed_origins: vec![],
-        trust_forwarded_for: false,
+        trusted_proxy_ips: vec![],
     })
     .unwrap();
     let restarted_handle = tokio::spawn(async move {

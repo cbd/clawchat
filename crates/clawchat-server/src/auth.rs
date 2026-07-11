@@ -30,9 +30,7 @@ pub fn load_or_create_key(path: &Path) -> std::io::Result<String> {
     }
 
     let key = generate_key();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    harden_parent_directory(path)?;
     write_owner_only_atomic(path, &key)?;
     Ok(key)
 }
@@ -40,9 +38,7 @@ pub fn load_or_create_key(path: &Path) -> std::io::Result<String> {
 /// Rotate the key: generate a new one and overwrite the file.
 pub fn rotate_key(path: &Path) -> std::io::Result<String> {
     let key = generate_key();
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    harden_parent_directory(path)?;
     write_owner_only_atomic(path, &key)?;
     Ok(key)
 }
@@ -87,6 +83,23 @@ pub(crate) fn harden_file_permissions(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+pub(crate) fn harden_parent_directory(path: &Path) -> std::io::Result<()> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(parent)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(parent)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,6 +117,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("auth.key");
         let first = load_or_create_key(&path).unwrap();
+        assert_eq!(mode(dir.path()), 0o700);
         assert_eq!(mode(&path), 0o600);
         let second = rotate_key(&path).unwrap();
         assert_ne!(first, second);

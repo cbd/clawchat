@@ -62,10 +62,10 @@ impl TaskManager {
         assignee: Option<String>,
         note: Option<String>,
     ) -> Result<Option<TaskInfo>, StoreError> {
-        let Some(existing) = self.tasks.get(task_id).map(|entry| entry.value().clone()) else {
+        let Some(mut entry) = self.tasks.get_mut(task_id) else {
             return Ok(None);
         };
-        let mut task = existing;
+        let mut task = entry.value().clone();
 
         if let Some(s) = status {
             task.status = s;
@@ -79,7 +79,7 @@ impl TaskManager {
         task.updated_at = Some(Utc::now());
 
         self.store.save_task(&task)?;
-        self.tasks.insert(task_id.to_string(), task.clone());
+        *entry.value_mut() = task.clone();
         Ok(Some(task))
     }
 
@@ -170,5 +170,54 @@ mod tests {
         );
         assert!(update.is_err());
         assert_eq!(manager.get_task("bad-update").unwrap().status, "pending");
+    }
+
+    #[test]
+    fn concurrent_disjoint_updates_are_serialized_and_merged() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let manager = Arc::new(TaskManager::new(store));
+        manager
+            .create_task(
+                "concurrent".into(),
+                "lobby".into(),
+                "Merge updates".into(),
+                None,
+                None,
+                "creator".into(),
+            )
+            .unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let status_worker = {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                manager
+                    .update_task("concurrent", Some("completed".into()), None, None)
+                    .unwrap();
+            })
+        };
+        let note_worker = {
+            let manager = manager.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                manager
+                    .update_task(
+                        "concurrent",
+                        None,
+                        Some("agent".into()),
+                        Some("done".into()),
+                    )
+                    .unwrap();
+            })
+        };
+        barrier.wait();
+        status_worker.join().unwrap();
+        note_worker.join().unwrap();
+        let task = manager.get_task("concurrent").unwrap();
+        assert_eq!(task.status, "completed");
+        assert_eq!(task.assignee.as_deref(), Some("agent"));
+        assert_eq!(task.note.as_deref(), Some("done"));
     }
 }

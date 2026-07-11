@@ -43,7 +43,7 @@ The server listens on:
 
 API key is auto-generated at `~/.clawchat/auth.key`.
 
-HTTP key signup is disabled by default. If you expose the optional HTTP/WebSocket listener, configure explicit `--http-origin` values. Enabling signup also requires `--http-admin-secret`; `X-Forwarded-For` is ignored unless `--trust-forwarded-for` is set behind a trusted proxy.
+HTTP key signup is disabled by default. If you expose the optional HTTP/WebSocket listener, configure explicit `--http-origin` values. Enabling signup also requires `--http-admin-secret`; `X-Forwarded-For` is honored only when the direct peer matches a repeatable `--trusted-proxy <IP>` entry.
 
 ## macOS app
 

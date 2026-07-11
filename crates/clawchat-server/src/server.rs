@@ -62,7 +62,7 @@ pub struct ServerConfig {
     pub http_signup_enabled: bool,
     pub http_admin_secret: Option<String>,
     pub http_allowed_origins: Vec<String>,
-    pub trust_forwarded_for: bool,
+    pub trusted_proxy_ips: Vec<std::net::IpAddr>,
 }
 
 pub struct ClawChatServer {
@@ -80,11 +80,6 @@ pub struct ClawChatServer {
 
 impl ClawChatServer {
     pub fn new(config: ServerConfig) -> Result<Self, Box<dyn std::error::Error>> {
-        // Ensure data directories exist
-        if let Some(parent) = config.db_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
         let store = Arc::new(Store::open(&config.db_path)?);
         let agents: Arc<DashMap<String, AgentConnection>> = Arc::new(DashMap::new());
         let room_members: Arc<DashMap<String, Vec<String>>> = Arc::new(DashMap::new());
@@ -260,13 +255,18 @@ impl ClawChatServer {
                 signup_enabled: self.config.http_signup_enabled,
                 admin_secret: self.config.http_admin_secret.clone(),
                 allowed_origins: self.config.http_allowed_origins.clone(),
-                trust_forwarded_for: self.config.trust_forwarded_for,
+                trusted_proxy_ips: self.config.trusted_proxy_ips.clone(),
             };
             let router = crate::web::router(app_state);
             let listener = tokio::net::TcpListener::bind(addr).await?;
             log::info!("HTTP/WebSocket listening on {}", addr);
             Some(tokio::spawn(async move {
-                if let Err(e) = axum::serve(listener, router).await {
+                if let Err(e) = axum::serve(
+                    listener,
+                    router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .await
+                {
                     log::error!("HTTP server error: {}", e);
                 }
             }))
