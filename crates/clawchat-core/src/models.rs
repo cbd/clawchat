@@ -12,7 +12,7 @@ pub struct AgentInfo {
     /// Last time this agent sent a message or typed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_active: Option<DateTime<Utc>>,
-    /// Presence status: "idle", "waiting", "working"
+    /// Presence status: "idle", "waiting", "working", "thinking"
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     /// Human-readable detail, e.g. "reviewing section 3"

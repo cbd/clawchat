@@ -74,6 +74,39 @@ fn reject_oversized(req_id: Option<&str>, content: &str, limits: &TierLimits) ->
     }
     None
 }
+
+/// Authorize a room-scoped operation consistently. Public and system rooms are
+/// readable by every authenticated key; private rooms are visible only to the
+/// owning key. Membership requirements are enforced separately by operations
+/// that mutate room coordination state.
+fn authorize_room(
+    req_id: Option<&str>,
+    room_id: &str,
+    agent_api_key: &str,
+    no_auth: bool,
+    store: &Arc<Store>,
+    ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+) -> Result<Room, Frame> {
+    let room = ephemeral_rooms
+        .get(room_id)
+        .map(|room| room.clone())
+        .or_else(|| store.get_room(room_id).ok().flatten())
+        .ok_or_else(|| {
+            Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::RoomNotFound, "Room not found"),
+            )
+        })?;
+    let allowed =
+        no_auth || room.visibility == "public" || room.owner_key.as_deref() == Some(agent_api_key);
+    if !allowed {
+        return Err(Frame::error(
+            req_id,
+            ErrorPayload::new(ErrorCode::AccessDenied, "This room is private"),
+        ));
+    }
+    Ok(room)
+}
 use crate::rate_limit::{RateLimiter, TierLimits};
 use crate::store::Store;
 use crate::tasks::TaskManager;
@@ -147,7 +180,15 @@ pub async fn handle_frame(
             .await
         }
         FrameType::LeaveRoom => {
-            handle_leave_room(req_id, frame.payload, agent_id, broker, ephemeral_rooms).await
+            handle_leave_room(
+                req_id,
+                frame.payload,
+                agent_id,
+                broker,
+                ephemeral_rooms,
+                no_auth,
+            )
+            .await
         }
         FrameType::SendMessage => {
             handle_send_message(
@@ -165,17 +206,64 @@ pub async fn handle_frame(
             )
             .await
         }
-        FrameType::GetHistory => handle_get_history(req_id, frame.payload, store).await,
-        FrameType::ListRooms => {
-            handle_list_rooms(req_id, frame.payload, store, ephemeral_rooms, agent_api_key, no_auth, broker)
-                .await
+        FrameType::GetHistory => {
+            handle_get_history(
+                req_id,
+                frame.payload,
+                store,
+                ephemeral_rooms,
+                agent_api_key,
+                no_auth,
+            )
+            .await
         }
-        FrameType::ListAgents => handle_list_agents(req_id, frame.payload, broker).await,
+        FrameType::ListRooms => {
+            handle_list_rooms(
+                req_id,
+                frame.payload,
+                store,
+                ephemeral_rooms,
+                agent_api_key,
+                no_auth,
+                broker,
+            )
+            .await
+        }
+        FrameType::ListAgents => {
+            handle_list_agents(
+                req_id,
+                frame.payload,
+                broker,
+                store,
+                ephemeral_rooms,
+                agent_api_key,
+                no_auth,
+            )
+            .await
+        }
         FrameType::RoomInfo => {
-            handle_room_info(req_id, frame.payload, store, broker, ephemeral_rooms).await
+            handle_room_info(
+                req_id,
+                frame.payload,
+                store,
+                broker,
+                ephemeral_rooms,
+                agent_api_key,
+                no_auth,
+            )
+            .await
         }
         FrameType::RoomTip => {
-            handle_room_tip(req_id, frame.payload, store, broker, ephemeral_rooms).await
+            handle_room_tip(
+                req_id,
+                frame.payload,
+                store,
+                broker,
+                ephemeral_rooms,
+                agent_api_key,
+                no_auth,
+            )
+            .await
         }
 
         // Voting
@@ -204,16 +292,36 @@ pub async fn handle_frame(
             .await
         }
         FrameType::GetVoteStatus => {
-            handle_get_vote_status(req_id, frame.payload, vote_mgr, store).await
+            handle_get_vote_status(
+                req_id,
+                frame.payload,
+                vote_mgr,
+                store,
+                ephemeral_rooms,
+                agent_api_key,
+                no_auth,
+            )
+            .await
         }
-        FrameType::ListVotes => handle_list_votes(req_id, frame.payload, vote_mgr, store).await,
+        FrameType::ListVotes => {
+            handle_list_votes(
+                req_id,
+                frame.payload,
+                vote_mgr,
+                store,
+                ephemeral_rooms,
+                agent_api_key,
+                no_auth,
+            )
+            .await
+        }
 
         // Elections
         FrameType::ElectLeader => {
             handle_elect_leader(req_id, frame.payload, agent_id, broker, vote_mgr).await
         }
         FrameType::DeclineElection => {
-            handle_decline_election(req_id, frame.payload, agent_id, vote_mgr).await
+            handle_decline_election(req_id, frame.payload, agent_id, broker, vote_mgr).await
         }
         FrameType::Decision => {
             handle_decision(
@@ -287,7 +395,16 @@ pub async fn handle_frame(
             handle_update_task(req_id, frame.payload, agent_id, broker, task_mgr).await
         }
         FrameType::ListTasks => {
-            handle_list_tasks(req_id, frame.payload, task_mgr).await
+            handle_list_tasks(
+                req_id,
+                frame.payload,
+                task_mgr,
+                store,
+                ephemeral_rooms,
+                agent_api_key,
+                no_auth,
+            )
+            .await
         }
 
         _ => Frame::error(
@@ -320,12 +437,17 @@ async fn handle_create_room(
 
     // Check room limit (skip in no_auth mode)
     if !no_auth && !agent_api_key.is_empty() {
-        let tier = store.get_key_tier(agent_api_key).unwrap_or_else(|_| "free".to_string());
+        let tier = store
+            .get_key_tier(agent_api_key)
+            .unwrap_or_else(|_| "free".to_string());
         let limits = TierLimits::for_tier(&tier);
         if !rate_limiter.check_room_limit(agent_api_key, &limits) {
             return Frame::error(
                 req_id,
-                ErrorPayload::new(ErrorCode::RateLimitRooms, "Room limit exceeded for this API key"),
+                ErrorPayload::new(
+                    ErrorCode::RateLimitRooms,
+                    "Room limit exceeded for this API key",
+                ),
             );
         }
     }
@@ -343,7 +465,11 @@ async fn handle_create_room(
             created_at: chrono::Utc::now(),
             created_by: Some(agent_id.to_string()),
             visibility: visibility.to_string(),
-            owner_key: if agent_api_key.is_empty() { None } else { Some(agent_api_key.to_string()) },
+            owner_key: if agent_api_key.is_empty() {
+                None
+            } else {
+                Some(agent_api_key.to_string())
+            },
             last_activity: None,
             member_count: None,
             encrypted: p.encrypted,
@@ -355,31 +481,40 @@ async fn handle_create_room(
             rate_limiter.add_room(agent_api_key);
         }
 
-        // Broadcast room creation to all connected agents
+        // Private room metadata is visible only to connections using the owner key.
         let event = Frame::event(FrameType::RoomCreated, serde_json::to_value(&room).unwrap());
         for entry in broker.agents.iter() {
-            broker.send_to_agent(entry.key(), event.clone());
+            if no_auth || room.visibility == "public" || entry.value().api_key == agent_api_key {
+                broker.send_to_agent(entry.key(), event.clone());
+            }
         }
 
         Frame::ok(req_id, serde_json::to_value(&room).unwrap())
     } else {
         // Validate parent exists if specified
         if let Some(ref pid) = p.parent_id {
-            let parent_exists =
-                store.get_room(pid).ok().flatten().is_some() || ephemeral_rooms.contains_key(pid);
-            if !parent_exists {
-                return Frame::error(
-                    req_id,
-                    ErrorPayload::new(ErrorCode::RoomNotFound, "Parent room not found"),
-                );
+            if let Err(error) =
+                authorize_room(req_id, pid, agent_api_key, no_auth, store, ephemeral_rooms)
+            {
+                return error;
             }
         }
 
-        let owner_key = if agent_api_key.is_empty() { None } else { Some(agent_api_key) };
+        let owner_key = if agent_api_key.is_empty() {
+            None
+        } else {
+            Some(agent_api_key)
+        };
 
         match store.create_room_with_visibility(
-            &room_id, &p.name, p.description.as_deref(), p.parent_id.as_deref(),
-            Some(agent_id), visibility, owner_key, p.encrypted,
+            &room_id,
+            &p.name,
+            p.description.as_deref(),
+            p.parent_id.as_deref(),
+            Some(agent_id),
+            visibility,
+            owner_key,
+            p.encrypted,
         ) {
             Ok(room) => {
                 // Track in rate limiter
@@ -387,9 +522,15 @@ async fn handle_create_room(
                     rate_limiter.add_room(agent_api_key);
                 }
 
-                let event = Frame::event(FrameType::RoomCreated, serde_json::to_value(&room).unwrap());
+                let event =
+                    Frame::event(FrameType::RoomCreated, serde_json::to_value(&room).unwrap());
                 for entry in broker.agents.iter() {
-                    broker.send_to_agent(entry.key(), event.clone());
+                    if no_auth
+                        || room.visibility == "public"
+                        || entry.value().api_key == agent_api_key
+                    {
+                        broker.send_to_agent(entry.key(), event.clone());
+                    }
                 }
                 Frame::ok(req_id, serde_json::to_value(&room).unwrap())
             }
@@ -501,6 +642,7 @@ async fn handle_leave_room(
     agent_id: &str,
     broker: &Arc<Broker>,
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    no_auth: bool,
 ) -> Frame {
     let p: LeaveRoomPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -543,7 +685,7 @@ async fn handle_leave_room(
 
     // Destroy ephemeral room if empty
     if leave_outcome.now_empty {
-        if let Some((_, _room)) = ephemeral_rooms.remove(&p.room_id) {
+        if let Some((_, room)) = ephemeral_rooms.remove(&p.room_id) {
             broker.remove_room(&p.room_id);
             broker.forget_ephemeral_seq(&p.room_id);
             let destroy_event = Frame::event(
@@ -551,7 +693,12 @@ async fn handle_leave_room(
                 serde_json::json!({"room_id": p.room_id}),
             );
             for entry in broker.agents.iter() {
-                broker.send_to_agent(entry.key(), destroy_event.clone());
+                if no_auth
+                    || room.visibility == "public"
+                    || entry.value().api_key.as_str() == room.owner_key.as_deref().unwrap_or("")
+                {
+                    broker.send_to_agent(entry.key(), destroy_event.clone());
+                }
             }
             log::info!("Ephemeral room {} destroyed (empty)", p.room_id);
         }
@@ -602,7 +749,9 @@ async fn handle_send_message(
 
     // Check size + message rate limit (skip in no_auth mode)
     if !no_auth && !agent_api_key.is_empty() {
-        let tier = store.get_key_tier(agent_api_key).unwrap_or_else(|_| "free".to_string());
+        let tier = store
+            .get_key_tier(agent_api_key)
+            .unwrap_or_else(|_| "free".to_string());
         let limits = TierLimits::for_tier(&tier);
         if let Some(err) = reject_oversized(req_id, &p.content, &limits) {
             return err;
@@ -682,7 +831,9 @@ async fn handle_send_message(
     if !p.mentions.is_empty() {
         log::debug!(
             "msg #{} room={} mentions={:?}",
-            message.seq, message.room_id, p.mentions
+            message.seq,
+            message.room_id,
+            p.mentions
         );
         broker.send_mentions(&p.mentions, &message, &p.room_id);
     }
@@ -806,10 +957,7 @@ async fn handle_thinking(
     // Broadcast as a `thinking` event (NOT message_received), so `wait`-style
     // listeners that key on chat messages won't wake on every pulse. Token is
     // deliberately not advanced — thinking out loud doesn't pass the turn.
-    let event = Frame::event(
-        FrameType::Thinking,
-        serde_json::to_value(&message).unwrap(),
-    );
+    let event = Frame::event(FrameType::Thinking, serde_json::to_value(&message).unwrap());
     broker.broadcast_to_room(&p.room_id, agent_id, &event);
 
     // Webhook subscriptions also see thinking pulses (unless they opted out
@@ -823,6 +971,9 @@ async fn handle_get_history(
     req_id: Option<&str>,
     payload: serde_json::Value,
     store: &Arc<Store>,
+    ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    no_auth: bool,
 ) -> Frame {
     let p: GetHistoryPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -834,7 +985,24 @@ async fn handle_get_history(
         }
     };
 
-    match store.get_history_filtered(&p.room_id, p.limit, p.before, p.since.as_deref(), p.since_seq) {
+    if let Err(error) = authorize_room(
+        req_id,
+        &p.room_id,
+        agent_api_key,
+        no_auth,
+        store,
+        ephemeral_rooms,
+    ) {
+        return error;
+    }
+
+    match store.get_history_filtered(
+        &p.room_id,
+        p.limit,
+        p.before,
+        p.since.as_deref(),
+        p.since_seq,
+    ) {
         Ok(messages) => Frame {
             id: Some(uuid::Uuid::new_v4().to_string()),
             reply_to: req_id.map(String::from),
@@ -857,6 +1025,8 @@ async fn handle_room_tip(
     store: &Arc<Store>,
     broker: &Arc<Broker>,
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    no_auth: bool,
 ) -> Frame {
     let p: RoomTipPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -867,6 +1037,17 @@ async fn handle_room_tip(
             )
         }
     };
+
+    if let Err(error) = authorize_room(
+        req_id,
+        &p.room_id,
+        agent_api_key,
+        no_auth,
+        store,
+        ephemeral_rooms,
+    ) {
+        return error;
+    }
 
     let seq = if ephemeral_rooms.contains_key(&p.room_id) {
         broker.ephemeral_room_tip(&p.room_id)
@@ -917,7 +1098,11 @@ async fn handle_list_rooms(
             }
         }
     } else {
-        let key = if agent_api_key.is_empty() { None } else { Some(agent_api_key) };
+        let key = if agent_api_key.is_empty() {
+            None
+        } else {
+            Some(agent_api_key)
+        };
         match store.list_rooms_for_key(key, p.parent_id.as_deref()) {
             Ok(r) => r,
             Err(e) => {
@@ -944,8 +1129,8 @@ async fn handle_list_rooms(
             rooms.push(room.clone());
         } else {
             // In cloud mode, only show public ephemeral rooms or rooms owned by this key
-            let visible = room.visibility == "public"
-                || room.owner_key.as_deref() == Some(agent_api_key);
+            let visible =
+                room.visibility == "public" || room.owner_key.as_deref() == Some(agent_api_key);
             if visible {
                 rooms.push(room.clone());
             }
@@ -976,9 +1161,26 @@ async fn handle_list_agents(
     req_id: Option<&str>,
     payload: serde_json::Value,
     broker: &Arc<Broker>,
+    store: &Arc<Store>,
+    ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    no_auth: bool,
 ) -> Frame {
     let p: ListAgentsPayload =
         serde_json::from_value(payload).unwrap_or(ListAgentsPayload { room_id: None });
+
+    if let Some(room_id) = &p.room_id {
+        if let Err(error) = authorize_room(
+            req_id,
+            room_id,
+            agent_api_key,
+            no_auth,
+            store,
+            ephemeral_rooms,
+        ) {
+            return error;
+        }
+    }
 
     let agents: Vec<AgentInfo> = match &p.room_id {
         Some(room_id) => {
@@ -1005,6 +1207,8 @@ async fn handle_room_info(
     store: &Arc<Store>,
     broker: &Arc<Broker>,
     ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    no_auth: bool,
 ) -> Frame {
     let p: RoomInfoPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -1016,21 +1220,16 @@ async fn handle_room_info(
         }
     };
 
-    // Find the room (check permanent then ephemeral)
-    let room = store
-        .get_room(&p.room_id)
-        .ok()
-        .flatten()
-        .or_else(|| ephemeral_rooms.get(&p.room_id).map(|r| r.clone()));
-
-    let room = match room {
-        Some(r) => r,
-        None => {
-            return Frame::error(
-                req_id,
-                ErrorPayload::new(ErrorCode::RoomNotFound, "Room not found"),
-            )
-        }
+    let room = match authorize_room(
+        req_id,
+        &p.room_id,
+        agent_api_key,
+        no_auth,
+        store,
+        ephemeral_rooms,
+    ) {
+        Ok(room) => room,
+        Err(error) => return error,
     };
 
     let members = broker.get_room_members(&p.room_id);
@@ -1046,6 +1245,9 @@ async fn handle_room_info(
             sub_rooms.push(entry.value().clone());
         }
     }
+    sub_rooms.retain(|child| {
+        no_auth || child.visibility == "public" || child.owner_key.as_deref() == Some(agent_api_key)
+    });
 
     Frame {
         id: Some(uuid::Uuid::new_v4().to_string()),
@@ -1180,10 +1382,35 @@ async fn handle_cast_vote(
     };
 
     // Check if vote is active (in-memory)
-    let (is_ephemeral, option_count) = match vote_mgr.active_votes.get(&p.vote_id) {
-        Some(vote) => (vote.is_ephemeral, Some(vote.options.len())),
-        None => (false, None),
+    let (is_ephemeral, option_count, room_id) = match vote_mgr.active_votes.get(&p.vote_id) {
+        Some(vote) => (
+            vote.is_ephemeral,
+            Some(vote.options.len()),
+            Some(vote.room_id.clone()),
+        ),
+        None => (
+            false,
+            None,
+            store
+                .get_vote_meta(&p.vote_id)
+                .ok()
+                .flatten()
+                .map(|vote| vote.room_id),
+        ),
     };
+
+    let Some(room_id) = room_id else {
+        return Frame::error(
+            req_id,
+            ErrorPayload::new(ErrorCode::VoteNotFound, "Vote not found"),
+        );
+    };
+    if !broker.is_agent_in_room(agent_id, &room_id) {
+        return Frame::error(
+            req_id,
+            ErrorPayload::new(ErrorCode::NotInRoom, "Must be in room to vote"),
+        );
+    }
 
     // Validate option index before persisting ballot.
     if let Some(count) = option_count {
@@ -1297,6 +1524,9 @@ async fn handle_get_vote_status(
     payload: serde_json::Value,
     vote_mgr: &Arc<VoteManager>,
     store: &Arc<Store>,
+    ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    no_auth: bool,
 ) -> Frame {
     let p: GetVoteStatusPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -1310,6 +1540,16 @@ async fn handle_get_vote_status(
 
     // Check in-memory active votes first.
     if let Some(vote) = vote_mgr.active_votes.get(&p.vote_id) {
+        if let Err(error) = authorize_room(
+            req_id,
+            &vote.room_id,
+            agent_api_key,
+            no_auth,
+            store,
+            ephemeral_rooms,
+        ) {
+            return error;
+        }
         let info = VoteInfo {
             vote_id: vote.vote_id.clone(),
             room_id: vote.room_id.clone(),
@@ -1342,6 +1582,17 @@ async fn handle_get_vote_status(
             ErrorPayload::new(ErrorCode::VoteNotFound, "Vote not found"),
         );
     };
+
+    if let Err(error) = authorize_room(
+        req_id,
+        &meta.room_id,
+        agent_api_key,
+        no_auth,
+        store,
+        ephemeral_rooms,
+    ) {
+        return error;
+    }
 
     let votes_cast = match store.get_vote_ballot_count(&meta.vote_id) {
         Ok(v) => v,
@@ -1376,6 +1627,9 @@ async fn handle_list_votes(
     payload: serde_json::Value,
     vote_mgr: &Arc<VoteManager>,
     store: &Arc<Store>,
+    ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    no_auth: bool,
 ) -> Frame {
     let p: ListVotesPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -1386,6 +1640,17 @@ async fn handle_list_votes(
             )
         }
     };
+
+    if let Err(error) = authorize_room(
+        req_id,
+        &p.room_id,
+        agent_api_key,
+        no_auth,
+        store,
+        ephemeral_rooms,
+    ) {
+        return error;
+    }
 
     let mut seen_vote_ids: HashSet<String> = HashSet::new();
     let mut votes: Vec<VoteInfo> = Vec::new();
@@ -1455,7 +1720,7 @@ async fn handle_list_votes(
         votes.push(vote_info_from_meta(&meta, votes_cast, tally));
     }
 
-    votes.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    votes.sort_by_key(|vote| std::cmp::Reverse(vote.created_at));
     votes.truncate(p.limit as usize);
 
     Frame::ok(
@@ -1535,6 +1800,7 @@ async fn handle_decline_election(
     req_id: Option<&str>,
     payload: serde_json::Value,
     agent_id: &str,
+    broker: &Arc<Broker>,
     vote_mgr: &Arc<VoteManager>,
 ) -> Frame {
     let p: DeclineElectionPayload = match serde_json::from_value(payload) {
@@ -1546,6 +1812,13 @@ async fn handle_decline_election(
             )
         }
     };
+
+    if !broker.is_agent_in_room(agent_id, &p.room_id) {
+        return Frame::error(
+            req_id,
+            ErrorPayload::new(ErrorCode::NotInRoom, "Must be in room to decline election"),
+        );
+    }
 
     match vote_mgr.decline_election(&p.room_id, agent_id) {
         Ok(()) => Frame::ok(
@@ -1583,6 +1856,12 @@ async fn handle_decision(
     };
 
     // Must be the room leader
+    if !broker.is_agent_in_room(agent_id, &p.room_id) {
+        return Frame::error(
+            req_id,
+            ErrorPayload::new(ErrorCode::NotInRoom, "Must be in room to issue decisions"),
+        );
+    }
     if !vote_mgr.is_leader(&p.room_id, agent_id) {
         return Frame::error(
             req_id,
@@ -1710,13 +1989,13 @@ async fn handle_set_presence(
 
     // Validate status value
     match p.status.as_str() {
-        "idle" | "waiting" | "working" => {}
+        "idle" | "waiting" | "working" | "thinking" => {}
         _ => {
             return Frame::error(
                 req_id,
                 ErrorPayload::new(
                     ErrorCode::InvalidPayload,
-                    "status must be one of: idle, waiting, working",
+                    "status must be one of: idle, waiting, working, thinking",
                 ),
             )
         }
@@ -1795,7 +2074,10 @@ async fn handle_assign_task(
     );
 
     // Broadcast to room
-    let event = Frame::event(FrameType::TaskAssigned, serde_json::to_value(&task).unwrap());
+    let event = Frame::event(
+        FrameType::TaskAssigned,
+        serde_json::to_value(&task).unwrap(),
+    );
     broker.broadcast_to_room_all(&p.room_id, &event);
 
     Frame::ok(req_id, serde_json::to_value(&task).unwrap())
@@ -1853,6 +2135,10 @@ async fn handle_list_tasks(
     req_id: Option<&str>,
     payload: serde_json::Value,
     task_mgr: &Arc<TaskManager>,
+    store: &Arc<Store>,
+    ephemeral_rooms: &Arc<dashmap::DashMap<String, Room>>,
+    agent_api_key: &str,
+    no_auth: bool,
 ) -> Frame {
     let p: ListTasksPayload = match serde_json::from_value(payload) {
         Ok(p) => p,
@@ -1863,6 +2149,17 @@ async fn handle_list_tasks(
             )
         }
     };
+
+    if let Err(error) = authorize_room(
+        req_id,
+        &p.room_id,
+        agent_api_key,
+        no_auth,
+        store,
+        ephemeral_rooms,
+    ) {
+        return error;
+    }
 
     let tasks = task_mgr.list_tasks(&p.room_id, p.status.as_deref());
 
@@ -1898,16 +2195,8 @@ async fn handle_subscribe(
         }
     };
 
-    // Validate URL — refuse anything that isn't http/https.
-    let url_lc = p.webhook_url.to_lowercase();
-    if !(url_lc.starts_with("http://") || url_lc.starts_with("https://")) {
-        return Frame::error(
-            req_id,
-            ErrorPayload::new(
-                ErrorCode::InvalidPayload,
-                "webhook_url must be http(s)",
-            ),
-        );
+    if let Err(error) = webhook_mgr.validate_url(&p.webhook_url).await {
+        return Frame::error(req_id, ErrorPayload::new(ErrorCode::InvalidPayload, error));
     }
     if p.secret.is_empty() {
         return Frame::error(
@@ -1916,33 +2205,15 @@ async fn handle_subscribe(
         );
     }
 
-    // Room access check: must exist and be readable by this API key.
-    let (room_exists, room_visibility, room_owner_key) = {
-        if let Some(room) = ephemeral_rooms.get(&p.room_id) {
-            (true, room.visibility.clone(), room.owner_key.clone())
-        } else if let Ok(Some(room)) = store.get_room(&p.room_id) {
-            (true, room.visibility.clone(), room.owner_key.clone())
-        } else {
-            (false, String::new(), None)
-        }
-    };
-    if !room_exists {
-        return Frame::error(
-            req_id,
-            ErrorPayload::new(ErrorCode::RoomNotFound, "Room not found"),
-        );
-    }
-    if !no_auth && room_visibility == "private" {
-        let can_access = match &room_owner_key {
-            Some(owner) => owner == agent_api_key,
-            None => true,
-        };
-        if !can_access {
-            return Frame::error(
-                req_id,
-                ErrorPayload::new(ErrorCode::AccessDenied, "This room is private"),
-            );
-        }
+    if let Err(error) = authorize_room(
+        req_id,
+        &p.room_id,
+        agent_api_key,
+        no_auth,
+        store,
+        ephemeral_rooms,
+    ) {
+        return error;
     }
 
     // Resolve since_seq: explicit value, else current tip ("only new messages").
@@ -1979,10 +2250,18 @@ async fn handle_subscribe(
     // anyway, and a brand-new sub on an ephemeral room with since_seq=tip is a
     // no-op which is fine.
     let now = chrono::Utc::now();
-    if let Ok(backlog) = store.get_history_filtered(&p.room_id, 1000, None, None, Some(since_seq))
-    {
-        for msg in backlog {
-            if !crate::webhooks::matches_filter(&sub, &msg) {
+    let mut backfill_cursor = since_seq;
+    loop {
+        let backlog =
+            match store.get_history_filtered(&p.room_id, 1000, None, None, Some(backfill_cursor)) {
+                Ok(backlog) => backlog,
+                Err(_) => break,
+            };
+        if backlog.is_empty() {
+            break;
+        }
+        for msg in &backlog {
+            if !crate::webhooks::matches_filter(&sub, msg) {
                 continue;
             }
             let delivery_id = uuid::Uuid::new_v4().to_string();
@@ -1994,8 +2273,15 @@ async fn handle_subscribe(
                 now,
             );
         }
-        webhook_mgr.wake();
+        backfill_cursor = backlog
+            .last()
+            .map(|message| message.seq)
+            .unwrap_or(backfill_cursor);
+        if backlog.len() < 1000 {
+            break;
+        }
     }
+    webhook_mgr.wake();
 
     Frame::ok(req_id, serde_json::to_value(&sub).unwrap_or_default())
 }
@@ -2122,5 +2408,8 @@ async fn handle_enable_subscription(
     }
     webhook_mgr.wake();
 
-    Frame::ok(req_id, serde_json::json!({"subscription_id": sub.subscription_id, "status": "active"}))
+    Frame::ok(
+        req_id,
+        serde_json::json!({"subscription_id": sub.subscription_id, "status": "active"}),
+    )
 }

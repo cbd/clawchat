@@ -29,6 +29,7 @@ async fn start_test_server() -> (
         db_path,
         auth_key_path: key_path,
         no_auth: false,
+        allow_private_webhooks: true,
     };
 
     let server = ClawChatServer::new(config).unwrap();
@@ -116,6 +117,27 @@ async fn test_invalid_key_rejected() {
     let (_handle, addr, _key, _tmp) = start_test_server().await;
     let result = ClawChatClient::connect_tcp(&addr, "wrong-key", "bad-agent", None, vec![]).await;
     assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn test_oversized_preauth_frame_is_disconnected_without_harming_server() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let (_handle, addr, key, _tmp) = start_test_server().await;
+    let mut stream = tokio::net::TcpStream::connect(&addr).await.unwrap();
+    stream
+        .write_all(&vec![b'x'; 1024 * 1024 + 1])
+        .await
+        .unwrap();
+    let mut byte = [0u8; 1];
+    let closed = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte))
+        .await
+        .expect("server should reject an oversized pre-auth frame promptly")
+        .unwrap();
+    assert_eq!(closed, 0, "oversized connection should be closed");
+
+    let healthy = connect_agent(&addr, &key, "healthy-after-oversize").await;
+    healthy.ping().await.unwrap();
 }
 
 #[tokio::test]
@@ -278,13 +300,22 @@ async fn test_seq_monotonic_per_room() {
         .unwrap();
     client.join_room(&other.room_id).await.unwrap();
 
-    let m1 = client.send_message("lobby", "a", None, vec![]).await.unwrap();
-    let m2 = client.send_message("lobby", "b", None, vec![]).await.unwrap();
+    let m1 = client
+        .send_message("lobby", "a", None, vec![])
+        .await
+        .unwrap();
+    let m2 = client
+        .send_message("lobby", "b", None, vec![])
+        .await
+        .unwrap();
     let n1 = client
         .send_message(&other.room_id, "x", None, vec![])
         .await
         .unwrap();
-    let m3 = client.send_message("lobby", "c", None, vec![]).await.unwrap();
+    let m3 = client
+        .send_message("lobby", "c", None, vec![])
+        .await
+        .unwrap();
 
     assert_eq!((m1.seq, m2.seq, m3.seq), (1, 2, 3));
     assert_eq!(n1.seq, 1);
@@ -342,7 +373,9 @@ async fn test_join_does_not_emit_chat_message() {
     let mut received_message = None;
     let collect = tokio::time::timeout(Duration::from_millis(300), async {
         loop {
-            let Ok(evt) = events_a.recv().await else { break };
+            let Ok(evt) = events_a.recv().await else {
+                break;
+            };
             match evt.frame.frame_type {
                 clawchat_core::FrameType::AgentJoined => saw_agent_joined = true,
                 clawchat_core::FrameType::MessageReceived => {
@@ -487,11 +520,21 @@ async fn test_agent_list() {
 }
 
 #[tokio::test]
-async fn test_mention_cross_room() {
-    let (_handle, addr, key, _tmp) = start_test_server().await;
+async fn test_mention_is_constrained_to_room_members() {
+    let (_handle, addr, key, tmp) = start_test_server().await;
+    let other_key = "mention-outsider-key";
+    rusqlite::Connection::open(tmp.path().join("test.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO api_keys (api_key, label) VALUES (?1, 'mention outsider')",
+            [other_key],
+        )
+        .unwrap();
 
     let agent_a = connect_agent(&addr, &key, "agent-a").await;
-    let agent_b = connect_agent(&addr, &key, "agent-b").await;
+    let agent_b = ClawChatClient::connect_tcp(&addr, other_key, "agent-b", None, vec![])
+        .await
+        .unwrap();
 
     agent_a.join_room("lobby").await.unwrap();
 
@@ -513,16 +556,38 @@ async fn test_mention_cross_room() {
         .await
         .unwrap();
 
-    let event = tokio::time::timeout(Duration::from_secs(2), async {
+    let leaked = tokio::time::timeout(Duration::from_millis(200), async {
         loop {
             let e = events_b.recv().await.unwrap();
             if e.frame.frame_type == FrameType::Mention {
-                return e;
+                return true;
             }
         }
     })
     .await
-    .expect("Mention within 2s");
+    .unwrap_or(false);
+    assert!(!leaked, "a mention must not leak content outside the room");
+
+    agent_b.join_room("lobby").await.unwrap();
+    agent_a
+        .send_message(
+            "lobby",
+            "member mention",
+            None,
+            vec![agent_b.agent_id.clone()],
+        )
+        .await
+        .unwrap();
+    let event = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = events_b.recv().await.unwrap();
+            if event.frame.frame_type == FrameType::Mention {
+                return event;
+            }
+        }
+    })
+    .await
+    .expect("a room member should receive its mention");
     assert_eq!(event.frame.frame_type, FrameType::Mention);
 }
 
@@ -671,6 +736,57 @@ async fn test_get_vote_status_after_close_returns_tally() {
         .unwrap_or(0);
     assert_eq!(count_a, 1);
     assert_eq!(count_b, 1);
+}
+
+#[tokio::test]
+async fn test_open_vote_and_ballots_survive_server_restart() {
+    let (handle, addr, key, tmp) = start_test_server().await;
+    let first = connect_agent(&addr, &key, "first").await;
+    let second = connect_agent(&addr, &key, "second").await;
+    first.join_room("lobby").await.unwrap();
+    second.join_room("lobby").await.unwrap();
+    let vote = first
+        .create_vote(
+            "lobby",
+            "survive restart",
+            None,
+            vec!["yes".into(), "no".into()],
+            None,
+        )
+        .await
+        .unwrap();
+    first.cast_vote(&vote.vote_id, 0).await.unwrap();
+    drop(first);
+    drop(second);
+    handle.abort();
+    let _ = handle.await;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let restarted_addr = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    let restarted = ClawChatServer::new(ServerConfig {
+        socket_path: tmp.path().join("vote-restart.sock"),
+        tcp_addr: Some(restarted_addr.clone()),
+        http_addr: None,
+        db_path: tmp.path().join("test.db"),
+        auth_key_path: tmp.path().join("auth.key"),
+        no_auth: false,
+        allow_private_webhooks: true,
+    })
+    .unwrap();
+    let restarted_handle = tokio::spawn(async move {
+        let _ = restarted.run().await;
+    });
+    sleep(Duration::from_millis(100)).await;
+    let first = connect_agent(&restarted_addr, &key, "first-after").await;
+    let second = connect_agent(&restarted_addr, &key, "second-after").await;
+    first.join_room("lobby").await.unwrap();
+    second.join_room("lobby").await.unwrap();
+    second.cast_vote(&vote.vote_id, 1).await.unwrap();
+    let status = first.get_vote_status(&vote.vote_id).await.unwrap();
+    assert_eq!(status.status, VoteStatus::Closed);
+    assert_eq!(status.votes_cast, 2);
+    restarted_handle.abort();
 }
 
 #[tokio::test]
@@ -1024,6 +1140,18 @@ async fn test_set_presence_updates_agent_info() {
     assert_eq!(me.status_detail.as_deref(), Some("reviewing section 3"));
     assert_eq!(me.progress, Some(57));
 
+    // Thinking is a valid presence state and can describe the current thought.
+    agent
+        .set_presence("thinking", Some("considering option B"), None)
+        .await
+        .unwrap();
+
+    let agents = agent.list_agents(None).await.unwrap();
+    let me = agents.iter().find(|a| a.name == "agent-a").unwrap();
+    assert_eq!(me.status.as_deref(), Some("thinking"));
+    assert_eq!(me.status_detail.as_deref(), Some("considering option B"));
+    assert_eq!(me.progress, None);
+
     // Set to waiting (clears detail and progress)
     agent.set_presence("waiting", None, None).await.unwrap();
 
@@ -1075,7 +1203,13 @@ async fn test_presence_update_broadcast_to_room() {
     .expect("agent-b should receive PresenceUpdate");
 
     assert_eq!(
-        event.frame.payload.get("agent_name").unwrap().as_str().unwrap(),
+        event
+            .frame
+            .payload
+            .get("agent_name")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "agent-a"
     );
     assert_eq!(
@@ -1083,11 +1217,23 @@ async fn test_presence_update_broadcast_to_room() {
         "working"
     );
     assert_eq!(
-        event.frame.payload.get("status_detail").unwrap().as_str().unwrap(),
+        event
+            .frame
+            .payload
+            .get("status_detail")
+            .unwrap()
+            .as_str()
+            .unwrap(),
         "fixing bug #42"
     );
     assert_eq!(
-        event.frame.payload.get("progress").unwrap().as_u64().unwrap(),
+        event
+            .frame
+            .payload
+            .get("progress")
+            .unwrap()
+            .as_u64()
+            .unwrap(),
         75
     );
 }
@@ -1498,7 +1644,10 @@ async fn test_turn_advances_on_disconnect() {
     let b_id = agent_b.agent_id.clone();
 
     // A holds.
-    assert_eq!(current_holder(&agent_b, "lobby").await.as_deref(), Some(a_id.as_str()));
+    assert_eq!(
+        current_holder(&agent_b, "lobby").await.as_deref(),
+        Some(a_id.as_str())
+    );
 
     let mut events_b = agent_b.subscribe();
 
@@ -1551,20 +1700,43 @@ async fn test_join_order_is_round_robin() {
     let b_id = b.agent_id.clone();
     let c_id = c.agent_id.clone();
 
-    assert_eq!(current_holder(&a, "lobby").await.as_deref(), Some(a_id.as_str()));
+    assert_eq!(
+        current_holder(&a, "lobby").await.as_deref(),
+        Some(a_id.as_str())
+    );
 
-    a.send_message("lobby", "from a", None, vec![]).await.unwrap();
-    assert_eq!(current_holder(&a, "lobby").await.as_deref(), Some(b_id.as_str()));
+    a.send_message("lobby", "from a", None, vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        current_holder(&a, "lobby").await.as_deref(),
+        Some(b_id.as_str())
+    );
 
-    b.send_message("lobby", "from b", None, vec![]).await.unwrap();
-    assert_eq!(current_holder(&a, "lobby").await.as_deref(), Some(c_id.as_str()));
+    b.send_message("lobby", "from b", None, vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        current_holder(&a, "lobby").await.as_deref(),
+        Some(c_id.as_str())
+    );
 
-    c.send_message("lobby", "from c", None, vec![]).await.unwrap();
-    assert_eq!(current_holder(&a, "lobby").await.as_deref(), Some(a_id.as_str()));
+    c.send_message("lobby", "from c", None, vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        current_holder(&a, "lobby").await.as_deref(),
+        Some(a_id.as_str())
+    );
 
     // And one more loop to confirm rotation is stable.
-    a.send_message("lobby", "from a again", None, vec![]).await.unwrap();
-    assert_eq!(current_holder(&a, "lobby").await.as_deref(), Some(b_id.as_str()));
+    a.send_message("lobby", "from a again", None, vec![])
+        .await
+        .unwrap();
+    assert_eq!(
+        current_holder(&a, "lobby").await.as_deref(),
+        Some(b_id.as_str())
+    );
 }
 
 // --- Thinking pulse tests ---
@@ -1584,7 +1756,10 @@ async fn test_thinking_does_not_advance_token() {
     let a_id = a.agent_id.clone();
 
     // A holds the token (joined first).
-    assert_eq!(current_holder(&a, "lobby").await.as_deref(), Some(a_id.as_str()));
+    assert_eq!(
+        current_holder(&a, "lobby").await.as_deref(),
+        Some(a_id.as_str())
+    );
 
     let mut events_b = b.subscribe();
 
@@ -1592,7 +1767,10 @@ async fn test_thinking_does_not_advance_token() {
     a.thinking("lobby", "reading the spec, ~30s").await.unwrap();
 
     // Token is unchanged — thinking doesn't pass the turn.
-    assert_eq!(current_holder(&a, "lobby").await.as_deref(), Some(a_id.as_str()));
+    assert_eq!(
+        current_holder(&a, "lobby").await.as_deref(),
+        Some(a_id.as_str())
+    );
 
     // B receives it as a `thinking` event, not `message_received`.
     let evt = tokio::time::timeout(Duration::from_secs(2), async {
@@ -1639,13 +1817,13 @@ async fn test_wait_since_seq_catches_backlog() {
     waiter.join_room("lobby").await.unwrap();
 
     // Send first — before waiter calls wait.
-    sender.send_message("lobby", "early", None, vec![]).await.unwrap();
-
-    // Plain wait (no since_seq) must NOT see the backlog. Short timeout = expect None.
-    let none = waiter
-        .wait_for_message("lobby", 1, None)
+    sender
+        .send_message("lobby", "early", None, vec![])
         .await
         .unwrap();
+
+    // Plain wait (no since_seq) must NOT see the backlog. Short timeout = expect None.
+    let none = waiter.wait_for_message("lobby", 1, None).await.unwrap();
     assert!(none.is_none(), "plain wait should not see backlog");
 
     // With since_seq=0 the wait returns the oldest chat message with seq > 0.
@@ -1710,7 +1888,9 @@ async fn test_kind_metadata_roundtrips_through_history() {
     )
     .await
     .unwrap();
-    a.send_message("lobby", "untagged note", None, vec![]).await.unwrap();
+    a.send_message("lobby", "untagged note", None, vec![])
+        .await
+        .unwrap();
 
     let hist = a.get_history("lobby", 50, None).await.unwrap();
     let kinds: Vec<Option<&str>> = hist
@@ -1719,11 +1899,7 @@ async fn test_kind_metadata_roundtrips_through_history() {
         .collect();
     assert_eq!(
         kinds,
-        vec![
-            Some("review_request"),
-            Some("checkpoint"),
-            None,
-        ]
+        vec![Some("review_request"), Some("checkpoint"), None,]
     );
 
     // Client-side filter on metadata.kind matches what the CLI does.
@@ -1782,17 +1958,25 @@ async fn test_thinking_appears_in_history() {
     let a = connect_agent(&addr, &key, "agent-a").await;
     a.join_room("lobby").await.unwrap();
 
-    a.send_message("lobby", "starting review", None, vec![]).await.unwrap();
+    a.send_message("lobby", "starting review", None, vec![])
+        .await
+        .unwrap();
     a.thinking("lobby", "considering option B").await.unwrap();
     a.thinking("lobby", "settled on option A").await.unwrap();
-    a.send_message("lobby", "ok, going with A", None, vec![]).await.unwrap();
+    a.send_message("lobby", "ok, going with A", None, vec![])
+        .await
+        .unwrap();
 
     // Late-joining client sees the full timeline including thoughts.
     let late = connect_agent(&addr, &key, "agent-late").await;
     late.join_room("lobby").await.unwrap();
     let history = late.get_history("lobby", 50, None).await.unwrap();
 
-    assert_eq!(history.len(), 4, "expected 4 entries (2 messages + 2 thoughts)");
+    assert_eq!(
+        history.len(),
+        4,
+        "expected 4 entries (2 messages + 2 thoughts)"
+    );
 
     let kinds: Vec<&str> = history
         .iter()
@@ -1822,7 +2006,10 @@ struct RecordedRequest {
 /// POST and returns `status_code`. Returns (base_url, captured_requests).
 async fn spawn_test_receiver(
     status_code: u16,
-) -> (String, std::sync::Arc<tokio::sync::Mutex<Vec<RecordedRequest>>>) {
+) -> (
+    String,
+    std::sync::Arc<tokio::sync::Mutex<Vec<RecordedRequest>>>,
+) {
     use axum::body::Bytes;
     use axum::http::{HeaderMap, StatusCode};
     use axum::routing::post;
@@ -1871,6 +2058,47 @@ async fn spawn_test_receiver(
     (format!("http://{}/hook", addr), captured)
 }
 
+async fn spawn_redirect_receiver() -> (
+    String,
+    std::sync::Arc<tokio::sync::Mutex<Vec<RecordedRequest>>>,
+) {
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::response::IntoResponse;
+    use axum::routing::post;
+    use axum::Router;
+
+    let captured = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let captured_clone = captured.clone();
+    let handler = move |headers: HeaderMap, body: Bytes| {
+        let captured = captured_clone.clone();
+        async move {
+            captured.lock().await.push(RecordedRequest {
+                body: String::from_utf8_lossy(&body).to_string(),
+                webhook_id: headers
+                    .get("webhook-id")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("")
+                    .to_string(),
+                webhook_timestamp: String::new(),
+                webhook_signature: String::new(),
+            });
+            (
+                StatusCode::FOUND,
+                [("location", "http://169.254.169.254/latest/meta-data")],
+            )
+                .into_response()
+        }
+    };
+    let app = Router::new().route("/hook", post(handler));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}/hook"), captured)
+}
+
 /// Verify a recorded request's Standard Webhooks signature matches the body.
 fn verify_signature(req: &RecordedRequest, secret: &str) -> bool {
     use base64::engine::general_purpose::STANDARD;
@@ -1885,10 +2113,7 @@ fn verify_signature(req: &RecordedRequest, secret: &str) -> bool {
     let Ok(expected) = STANDARD.decode(sig_b64) else {
         return false;
     };
-    let signed = format!(
-        "{}.{}.{}",
-        req.webhook_id, req.webhook_timestamp, req.body
-    );
+    let signed = format!("{}.{}.{}", req.webhook_id, req.webhook_timestamp, req.body);
     let mut mac = HmacSha256::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(signed.as_bytes());
     mac.verify_slice(&expected).is_ok()
@@ -2045,7 +2270,10 @@ async fn test_webhook_retries_on_5xx() {
     // First attempt is immediate; first retry is 1s later. By 3s we should see
     // at least the initial + 1 retry.
     let saw_retries = wait_for_deliveries(&captured, 2, Duration::from_secs(5)).await;
-    assert!(saw_retries, "expected at least 2 attempts (1 initial + 1 retry) on a 500 receiver");
+    assert!(
+        saw_retries,
+        "expected at least 2 attempts (1 initial + 1 retry) on a 500 receiver"
+    );
 
     // And the row should not have been cleared (the sub stays active during
     // retry; the delivery row stays queued).
@@ -2053,6 +2281,26 @@ async fn test_webhook_retries_on_5xx() {
     assert!(
         subs.iter().any(|s| s.status == "active"),
         "subscription should still be active during the retry window"
+    );
+}
+
+#[tokio::test]
+async fn test_webhook_does_not_follow_redirects() {
+    let (_handle, addr, key, _tmp) = start_test_server().await;
+    let (hook_url, captured) = spawn_redirect_receiver().await;
+    let agent = connect_agent(&addr, &key, "redirect-test").await;
+    agent.join_room("lobby").await.unwrap();
+    agent
+        .create_subscription("lobby", &hook_url, "s", vec![], None, None, false, Some(0))
+        .await
+        .unwrap();
+    agent
+        .send_message("lobby", "do not redirect", None, vec![])
+        .await
+        .unwrap();
+    assert!(
+        wait_for_deliveries(&captured, 2, Duration::from_secs(5)).await,
+        "a 302 must be treated as a failed attempt and retried at the pinned origin"
     );
 }
 
@@ -2065,21 +2313,18 @@ async fn test_webhook_backfill_on_create() {
     agent.join_room("lobby").await.unwrap();
 
     // Pre-existing messages, BEFORE the subscription exists.
-    agent.send_message("lobby", "past 1", None, vec![]).await.unwrap();
-    agent.send_message("lobby", "past 2", None, vec![]).await.unwrap();
+    agent
+        .send_message("lobby", "past 1", None, vec![])
+        .await
+        .unwrap();
+    agent
+        .send_message("lobby", "past 2", None, vec![])
+        .await
+        .unwrap();
 
     // Now create the sub with since_seq=0 — both past messages should be replayed.
     agent
-        .create_subscription(
-            "lobby",
-            &hook_url,
-            "s",
-            vec![],
-            None,
-            None,
-            false,
-            Some(0),
-        )
+        .create_subscription("lobby", &hook_url, "s", vec![], None, None, false, Some(0))
         .await
         .unwrap();
 
@@ -2099,6 +2344,52 @@ async fn test_webhook_backfill_on_create() {
 }
 
 #[tokio::test]
+async fn test_webhook_backfill_is_not_capped_at_one_thousand() {
+    let (_handle, addr, key, tmp) = start_test_server().await;
+    {
+        let mut conn = rusqlite::Connection::open(tmp.path().join("test.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        for seq in 1..=1005i64 {
+            tx.execute(
+                "INSERT INTO messages
+                 (message_id, room_id, agent_id, agent_name, content, metadata, seq)
+                 VALUES (?1, 'lobby', 'seed', 'Seed', 'backfill', '{}', ?2)",
+                rusqlite::params![format!("backfill-{seq}"), seq],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+    }
+
+    let client = connect_agent(&addr, &key, "subscriber").await;
+    let subscription = client
+        .create_subscription(
+            "lobby",
+            "http://127.0.0.1:9/hook",
+            "secret",
+            vec![],
+            None,
+            None,
+            true,
+            Some(0),
+        )
+        .await
+        .unwrap();
+    let count: i64 = rusqlite::Connection::open(tmp.path().join("test.db"))
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM subscription_deliveries WHERE subscription_id = ?1",
+            [&subscription.subscription_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count, 1005,
+        "backfill must page through the complete history"
+    );
+}
+
+#[tokio::test]
 async fn test_webhook_idempotent_enqueue_per_sub_per_seq() {
     // Same message can be delivered to TWO different subs, but the same
     // (subscription_id, message_seq) can't be queued twice — the unique index
@@ -2112,11 +2403,29 @@ async fn test_webhook_idempotent_enqueue_per_sub_per_seq() {
     agent.join_room("lobby").await.unwrap();
 
     agent
-        .create_subscription("lobby", &hook_url_a, "s", vec![], None, None, false, Some(0))
+        .create_subscription(
+            "lobby",
+            &hook_url_a,
+            "s",
+            vec![],
+            None,
+            None,
+            false,
+            Some(0),
+        )
         .await
         .unwrap();
     agent
-        .create_subscription("lobby", &hook_url_b, "s", vec![], None, None, false, Some(0))
+        .create_subscription(
+            "lobby",
+            &hook_url_b,
+            "s",
+            vec![],
+            None,
+            None,
+            false,
+            Some(0),
+        )
         .await
         .unwrap();
 
@@ -2130,8 +2439,16 @@ async fn test_webhook_idempotent_enqueue_per_sub_per_seq() {
 
     // Wait a beat to ensure no duplicates land.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    assert_eq!(captured_a.lock().await.len(), 1, "receiver A: exactly 1 delivery");
-    assert_eq!(captured_b.lock().await.len(), 1, "receiver B: exactly 1 delivery");
+    assert_eq!(
+        captured_a.lock().await.len(),
+        1,
+        "receiver A: exactly 1 delivery"
+    );
+    assert_eq!(
+        captured_b.lock().await.len(),
+        1,
+        "receiver B: exactly 1 delivery"
+    );
 }
 
 #[tokio::test]
@@ -2226,7 +2543,9 @@ async fn test_agent_id_takeover() {
         .await
         .unwrap();
     a1.join_room("lobby").await.unwrap();
-    a1.send_message("lobby", "from a1", None, vec![]).await.unwrap();
+    a1.send_message("lobby", "from a1", None, vec![])
+        .await
+        .unwrap();
 
     // A second connection with the SAME agent_id (still live) must take over
     // instead of being rejected with agent_id_taken — this is the rapid
@@ -2253,6 +2572,261 @@ async fn test_agent_id_takeover() {
     a2.send_message("lobby", "a2 still alive", None, vec![])
         .await
         .expect("a2 must survive a1's delayed disconnect cleanup");
+}
+
+#[tokio::test]
+async fn test_agent_id_takeover_is_bound_to_api_key() {
+    let (_handle, addr, key_a, tmp) = start_test_server().await;
+    let key_b = "second-valid-api-key";
+    let db_path = tmp.path().join("test.db");
+    rusqlite::Connection::open(&db_path)
+        .unwrap()
+        .execute(
+            "INSERT INTO api_keys (api_key, label) VALUES (?1, 'test key b')",
+            [key_b],
+        )
+        .unwrap();
+
+    let owner = ClawChatClient::connect_tcp(
+        &addr,
+        &key_a,
+        "owner",
+        Some("credential-bound-agent"),
+        vec![],
+    )
+    .await
+    .unwrap();
+    owner.join_room("lobby").await.unwrap();
+
+    let live_takeover = ClawChatClient::connect_tcp(
+        &addr,
+        key_b,
+        "attacker",
+        Some("credential-bound-agent"),
+        vec![],
+    )
+    .await;
+    assert!(
+        live_takeover.is_err(),
+        "another key must not take over a live identity"
+    );
+
+    drop(owner);
+    sleep(Duration::from_millis(300)).await;
+    let stashed_takeover = ClawChatClient::connect_tcp(
+        &addr,
+        key_b,
+        "attacker",
+        Some("credential-bound-agent"),
+        vec![],
+    )
+    .await;
+    assert!(
+        stashed_takeover.is_err(),
+        "another key must not reclaim a stashed identity"
+    );
+
+    ClawChatClient::connect_tcp(
+        &addr,
+        &key_a,
+        "owner",
+        Some("credential-bound-agent"),
+        vec![],
+    )
+    .await
+    .expect("the owning key should still reclaim its stable identity");
+}
+
+#[tokio::test]
+async fn test_agent_id_ownership_survives_server_restart() {
+    let (handle, addr, key_a, tmp) = start_test_server().await;
+    let owner =
+        ClawChatClient::connect_tcp(&addr, &key_a, "owner", Some("restart-owned-agent"), vec![])
+            .await
+            .unwrap();
+    drop(owner);
+    handle.abort();
+    let _ = handle.await;
+
+    let key_b = "restart-outsider-key";
+    rusqlite::Connection::open(tmp.path().join("test.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO api_keys (api_key, label) VALUES (?1, 'restart outsider')",
+            [key_b],
+        )
+        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let restarted_addr = listener.local_addr().unwrap().to_string();
+    drop(listener);
+    let restarted = ClawChatServer::new(ServerConfig {
+        socket_path: tmp.path().join("restart.sock"),
+        tcp_addr: Some(restarted_addr.clone()),
+        http_addr: None,
+        db_path: tmp.path().join("test.db"),
+        auth_key_path: tmp.path().join("auth.key"),
+        no_auth: false,
+        allow_private_webhooks: true,
+    })
+    .unwrap();
+    let restarted_handle = tokio::spawn(async move {
+        let _ = restarted.run().await;
+    });
+    sleep(Duration::from_millis(100)).await;
+
+    let stolen = ClawChatClient::connect_tcp(
+        &restarted_addr,
+        key_b,
+        "attacker",
+        Some("restart-owned-agent"),
+        vec![],
+    )
+    .await;
+    assert!(stolen.is_err(), "identity ownership must survive restart");
+    ClawChatClient::connect_tcp(
+        &restarted_addr,
+        &key_a,
+        "owner",
+        Some("restart-owned-agent"),
+        vec![],
+    )
+    .await
+    .expect("the original credential must retain its identity after restart");
+    restarted_handle.abort();
+}
+
+#[tokio::test]
+async fn test_private_room_reads_and_creation_events_are_key_scoped() {
+    let (_handle, addr, key_a, tmp) = start_test_server().await;
+    let key_b = "private-room-outsider-key";
+    rusqlite::Connection::open(tmp.path().join("test.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO api_keys (api_key, label) VALUES (?1, 'outsider')",
+            [key_b],
+        )
+        .unwrap();
+
+    let owner = connect_agent(&addr, &key_a, "owner").await;
+    let outsider = connect_agent(&addr, key_b, "outsider").await;
+    let mut outsider_events = outsider.subscribe();
+    let room = owner
+        .create_room("key-private-room", None, None, false)
+        .await
+        .unwrap();
+    owner.join_room(&room.room_id).await.unwrap();
+    owner
+        .send_message(&room.room_id, "private", None, vec![])
+        .await
+        .unwrap();
+    let vote = owner
+        .create_vote(
+            &room.room_id,
+            "private vote",
+            None,
+            vec!["a".into(), "b".into()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(outsider.get_history(&room.room_id, 10, None).await.is_err());
+    assert!(outsider.room_tip(&room.room_id).await.is_err());
+    assert!(outsider.room_info(&room.room_id).await.is_err());
+    assert!(outsider.list_agents(Some(&room.room_id)).await.is_err());
+    assert!(outsider.list_votes(&room.room_id, 10).await.is_err());
+    assert!(outsider.get_vote_status(&vote.vote_id).await.is_err());
+
+    let leaked_creation = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if let Ok(event) = outsider_events.recv().await {
+                if event.frame.frame_type == FrameType::RoomCreated
+                    && event.frame.payload.get("room_id").and_then(|v| v.as_str())
+                        == Some(room.room_id.as_str())
+                {
+                    return true;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        !leaked_creation,
+        "private RoomCreated must not leak across API keys"
+    );
+
+    let ephemeral = owner
+        .create_room("key-private-ephemeral", None, None, true)
+        .await
+        .unwrap();
+    owner.join_room(&ephemeral.room_id).await.unwrap();
+    owner.leave_room(&ephemeral.room_id).await.unwrap();
+    let leaked_destroy = tokio::time::timeout(Duration::from_millis(200), async {
+        loop {
+            if let Ok(event) = outsider_events.recv().await {
+                if event.frame.frame_type == FrameType::RoomDestroyed
+                    && event.frame.payload.get("room_id").and_then(|v| v.as_str())
+                        == Some(ephemeral.room_id.as_str())
+                {
+                    return true;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        !leaked_destroy,
+        "private RoomDestroyed must not leak across API keys"
+    );
+}
+
+#[tokio::test]
+async fn test_legacy_ownerless_private_room_fails_closed() {
+    let (_handle, addr, key, tmp) = start_test_server().await;
+    rusqlite::Connection::open(tmp.path().join("test.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO rooms (room_id, name, visibility, owner_key)
+             VALUES ('legacy-private', 'legacy-private', 'private', NULL)",
+            [],
+        )
+        .unwrap();
+    let client = connect_agent(&addr, &key, "reader").await;
+    assert!(
+        client.room_info("legacy-private").await.is_err(),
+        "an authenticated key must not inherit ownerless legacy private rooms"
+    );
+    assert!(
+        client.room_info("lobby").await.is_ok(),
+        "the public lobby must remain accessible"
+    );
+}
+
+#[tokio::test]
+async fn test_nonmember_cannot_cast_room_vote() {
+    let (_handle, addr, key, _tmp) = start_test_server().await;
+    let owner = connect_agent(&addr, &key, "owner").await;
+    let outsider = connect_agent(&addr, &key, "outsider").await;
+    let room = owner
+        .create_room_with_options("public-vote-room", None, None, false, true, false)
+        .await
+        .unwrap();
+    owner.join_room(&room.room_id).await.unwrap();
+    let vote = owner
+        .create_vote(
+            &room.room_id,
+            "members only",
+            None,
+            vec!["yes".into(), "no".into()],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let result = outsider.cast_vote(&vote.vote_id, 0).await;
+    assert!(result.is_err(), "a nonmember must not cast a room vote");
 }
 
 // --- Message size cap ---
@@ -2289,10 +2863,7 @@ async fn test_message_size_cap() {
     }
 
     // Thinking shares the same cap — it can't be used to dodge the limit.
-    let err = agent
-        .thinking(&room.room_id, &oversized)
-        .await
-        .unwrap_err();
+    let err = agent.thinking(&room.room_id, &oversized).await.unwrap_err();
     match err {
         clawchat_client::ClientError::Server { code, .. } => assert_eq!(
             code,
@@ -2341,18 +2912,17 @@ async fn test_protocol_version_gate() {
 
     // A pre-versioning client (no protocol_version field) is treated as v1 and
     // accepted; the OK reply advertises the server's protocol version.
-    let reply = raw_register(
-        &addr,
-        serde_json::json!({ "key": key, "name": "legacy" }),
-    )
-    .await;
+    let reply = raw_register(&addr, serde_json::json!({ "key": key, "name": "legacy" })).await;
     assert_ne!(
         reply.frame_type,
         FrameType::Error,
         "a pre-versioning (legacy) client must still be accepted"
     );
     assert_eq!(
-        reply.payload.get("protocol_version").and_then(|v| v.as_u64()),
+        reply
+            .payload
+            .get("protocol_version")
+            .and_then(|v| v.as_u64()),
         Some(clawchat_core::PROTOCOL_VERSION as u64),
         "the register reply must advertise the server's protocol version"
     );

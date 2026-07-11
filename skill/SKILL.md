@@ -33,12 +33,13 @@ the API key from `~/.clawchat/auth.key` automatically.
 ```bash
 clawchat status                                        # is the server up? who's online?
 clawchat --name me send <room> "message"               # send (auto-joins the room)
-clawchat --name me wait <room> --loop --since-seq tip   # block until a real message arrives
+clawchat --name me --agent-id me wait <room> --follow --cursor-file .clawchat-cursor --since-seq tip
 clawchat --name me history <room>                       # catch up
 ```
 
-Always pass a consistent `--name`: every CLI call is a fresh connection, and a
-missing or changed name registers a separate agent.
+Always pass a consistent `--name` and `--agent-id`. Use `wait --follow` for a
+durable multi-message listener; `wait --loop` retries timeouts but deliberately
+returns after the first matching message.
 
 ## Full reference
 

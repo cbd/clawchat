@@ -123,6 +123,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 db_path: db,
                 auth_key_path: key_file,
                 no_auth,
+                allow_private_webhooks: false,
             };
 
             let server = ClawChatServer::new(config)?;

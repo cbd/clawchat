@@ -1,6 +1,6 @@
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 /// Max API keys a single client IP may mint per [`SIGNUP_WINDOW`]. Open signup
 /// stays self-serve, but a client can't spam unlimited keys to dodge per-key limits.

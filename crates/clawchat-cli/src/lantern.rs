@@ -19,7 +19,15 @@ pub const LANTERN_KIND: &str = "lantern";
 
 /// The nine thread verbs (HELLO is handled separately — it has its own shape).
 pub const VERBS: &[&str] = &[
-    "PROBE", "ASSERT", "CHALLENGE", "RESOLVE", "FUSE", "SYNC", "SPARK", "HARVEST", "BURY",
+    "PROBE",
+    "ASSERT",
+    "CHALLENGE",
+    "RESOLVE",
+    "FUSE",
+    "SYNC",
+    "SPARK",
+    "HARVEST",
+    "BURY",
 ];
 
 /// `basis` values eligible for calibration scoring.
@@ -45,7 +53,14 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    pub fn new(verb: &str, from: &str, thread: Option<i64>, reply_to: Option<i64>, intent: Option<String>, body: serde_json::Value) -> Self {
+    pub fn new(
+        verb: &str,
+        from: &str,
+        thread: Option<i64>,
+        reply_to: Option<i64>,
+        intent: Option<String>,
+        body: serde_json::Value,
+    ) -> Self {
         Self {
             v: LANTERN_VERSION.to_string(),
             verb: verb.to_string(),
@@ -131,8 +146,12 @@ pub fn parse(content: &str) -> Option<Parsed> {
         return None;
     }
     match value.get("type").and_then(|t| t.as_str()) {
-        Some("HELLO") => serde_json::from_value::<Hello>(value).ok().map(Parsed::Hello),
-        Some(_) => serde_json::from_value::<Envelope>(value).ok().map(Parsed::Verb),
+        Some("HELLO") => serde_json::from_value::<Hello>(value)
+            .ok()
+            .map(Parsed::Hello),
+        Some(_) => serde_json::from_value::<Envelope>(value)
+            .ok()
+            .map(Parsed::Verb),
         None => None,
     }
 }
@@ -156,13 +175,24 @@ pub fn validate(value: &serde_json::Value) -> Vec<String> {
             return errs;
         }
     };
-    let body = value.get("body").cloned().unwrap_or(serde_json::Value::Null);
+    let body = value
+        .get("body")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let nonempty = |b: &serde_json::Value, k: &str| {
-        b.get(k).and_then(|x| x.as_str()).map(|s| !s.trim().is_empty()).unwrap_or(false)
+        b.get(k)
+            .and_then(|x| x.as_str())
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
     };
 
     if verb == "HELLO" {
-        if value.get("agent_name").and_then(|x| x.as_str()).unwrap_or("").is_empty() {
+        if value
+            .get("agent_name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .is_empty()
+        {
             errs.push("HELLO requires `agent_name`".into());
         }
         return errs;
@@ -171,7 +201,12 @@ pub fn validate(value: &serde_json::Value) -> Vec<String> {
     if !VERBS.contains(&verb) {
         errs.push(format!("unknown verb `{verb}`"));
     }
-    if value.get("from").and_then(|x| x.as_str()).unwrap_or("").is_empty() {
+    if value
+        .get("from")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .is_empty()
+    {
         errs.push("missing `from`".into());
     }
 
@@ -187,7 +222,10 @@ pub fn validate(value: &serde_json::Value) -> Vec<String> {
             }
             // The defining rule: an ASSERT without falsifiable_by is malformed.
             if !nonempty(&body, "falsifiable_by") {
-                errs.push("ASSERT requires `body.falsifiable_by` (what observation would retract it)".into());
+                errs.push(
+                    "ASSERT requires `body.falsifiable_by` (what observation would retract it)"
+                        .into(),
+                );
             }
             check_confidence(&body, &mut errs, false);
         }
@@ -283,7 +321,13 @@ impl Thread {
     /// One-line headline: the opening claim/question, else the first intent.
     pub fn headline(&self) -> String {
         let first = &self.messages[0];
-        let pick = |k: &str| first.body.get(k).and_then(|v| v.as_str()).map(str::to_string);
+        let pick = |k: &str| {
+            first
+                .body
+                .get(k)
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        };
         pick("claim")
             .or_else(|| pick("question"))
             .or_else(|| first.intent.clone())
@@ -337,10 +381,12 @@ pub fn reconstruct(history: &[ChatMessage]) -> Reconstructed {
         .into_iter()
         .map(|(id, mut msgs)| {
             msgs.sort_by_key(|m| m.seq);
-            let resolve_basis = msgs
-                .iter()
-                .find(|m| m.verb == "RESOLVE")
-                .and_then(|m| m.body.get("basis").and_then(|b| b.as_str()).map(str::to_string));
+            let resolve_basis = msgs.iter().find(|m| m.verb == "RESOLVE").and_then(|m| {
+                m.body
+                    .get("basis")
+                    .and_then(|b| b.as_str())
+                    .map(str::to_string)
+            });
             let state = if msgs.iter().any(|m| m.verb == "FUSE") {
                 ThreadState::Fused
             } else if msgs.iter().any(|m| m.verb == "RESOLVE") {
@@ -348,11 +394,21 @@ pub fn reconstruct(history: &[ChatMessage]) -> Reconstructed {
             } else {
                 ThreadState::Open
             };
-            Thread { id, messages: msgs, state, resolve_basis }
+            Thread {
+                id,
+                messages: msgs,
+                state,
+                resolve_basis,
+            }
         })
         .collect();
 
-    Reconstructed { hellos, threads, shared_state, fuse_count }
+    Reconstructed {
+        hellos,
+        threads,
+        shared_state,
+        fuse_count,
+    }
 }
 
 // --- Calibration ---
@@ -391,7 +447,8 @@ pub fn calibration(rec: &Reconstructed) -> Calibration {
             .filter(|m| m.verb == "FUSE")
             .filter_map(|m| m.body.get("outcomes").and_then(|o| o.as_object()))
             .flat_map(|o| {
-                o.iter().filter_map(|(k, v)| Some((k.parse::<i64>().ok()?, v.as_bool()?)))
+                o.iter()
+                    .filter_map(|(k, v)| Some((k.parse::<i64>().ok()?, v.as_bool()?)))
             })
             .collect();
         if outcomes.is_empty() {
@@ -402,10 +459,18 @@ pub fn calibration(rec: &Reconstructed) -> Calibration {
             if m.verb != "ASSERT" && m.verb != "CHALLENGE" {
                 continue;
             }
-            let Some(held) = outcomes.get(&m.seq) else { continue };
-            let Some(conf) = m.body.get("confidence").and_then(|c| c.as_f64()) else { continue };
+            let Some(held) = outcomes.get(&m.seq) else {
+                continue;
+            };
+            let Some(conf) = m.body.get("confidence").and_then(|c| c.as_f64()) else {
+                continue;
+            };
             let conf = conf.clamp(1e-6, 1.0 - 1e-6);
-            let loss = if *held { -conf.ln() } else { -(1.0 - conf).ln() };
+            let loss = if *held {
+                -conf.ln()
+            } else {
+                -(1.0 - conf).ln()
+            };
             let loss = loss.clamp(0.0, max);
             let entry = cal.per_agent.entry(m.from.clone()).or_insert((0.0, 0));
             entry.0 += loss;
@@ -435,19 +500,38 @@ mod tests {
 
     #[test]
     fn assert_without_falsifiable_by_is_invalid() {
-        let env = Envelope::new("ASSERT", "a", None, None, None, serde_json::json!({"claim": "x"}));
+        let env = Envelope::new(
+            "ASSERT",
+            "a",
+            None,
+            None,
+            None,
+            serde_json::json!({"claim": "x"}),
+        );
         let errs = validate(&serde_json::to_value(&env).unwrap());
         assert!(errs.iter().any(|e| e.contains("falsifiable_by")));
 
-        let ok = Envelope::new("ASSERT", "a", None, None, None,
-            serde_json::json!({"claim": "x", "falsifiable_by": "a test"}));
+        let ok = Envelope::new(
+            "ASSERT",
+            "a",
+            None,
+            None,
+            None,
+            serde_json::json!({"claim": "x", "falsifiable_by": "a test"}),
+        );
         assert!(validate(&serde_json::to_value(&ok).unwrap()).is_empty());
     }
 
     #[test]
     fn challenge_must_stake_confidence_and_test() {
-        let env = Envelope::new("CHALLENGE", "b", Some(1), Some(1), None,
-            serde_json::json!({"target_seq": 1, "counter_claim": "no"}));
+        let env = Envelope::new(
+            "CHALLENGE",
+            "b",
+            Some(1),
+            Some(1),
+            None,
+            serde_json::json!({"target_seq": 1, "counter_claim": "no"}),
+        );
         let errs = validate(&serde_json::to_value(&env).unwrap());
         assert!(errs.iter().any(|e| e.contains("confidence")));
         assert!(errs.iter().any(|e| e.contains("test")));
@@ -455,15 +539,39 @@ mod tests {
 
     #[test]
     fn reconstruct_groups_thread_by_opening_seq() {
-        let a = Envelope::new("ASSERT", "a", None, None, None,
-            serde_json::json!({"claim": "needs rollback gate", "falsifiable_by": "x", "confidence": 0.7}));
-        let c = Envelope::new("CHALLENGE", "b", Some(10), Some(10), None,
-            serde_json::json!({"target_seq": 10, "counter_claim": "exists as recovery", "confidence": 0.6, "test": "grep"}));
-        let r = Envelope::new("RESOLVE", "a", Some(10), Some(11), None,
-            serde_json::json!({"observation": "no rollback gate", "basis": "artifact"}));
-        let f = Envelope::new("FUSE", "a", Some(10), Some(12), None,
+        let a = Envelope::new(
+            "ASSERT",
+            "a",
+            None,
+            None,
+            None,
+            serde_json::json!({"claim": "needs rollback gate", "falsifiable_by": "x", "confidence": 0.7}),
+        );
+        let c = Envelope::new(
+            "CHALLENGE",
+            "b",
+            Some(10),
+            Some(10),
+            None,
+            serde_json::json!({"target_seq": 10, "counter_claim": "exists as recovery", "confidence": 0.6, "test": "grep"}),
+        );
+        let r = Envelope::new(
+            "RESOLVE",
+            "a",
+            Some(10),
+            Some(11),
+            None,
+            serde_json::json!({"observation": "no rollback gate", "basis": "artifact"}),
+        );
+        let f = Envelope::new(
+            "FUSE",
+            "a",
+            Some(10),
+            Some(12),
+            None,
             serde_json::json!({"synthesis": "add gate", "shared_state_delta": {"missing_work": ["gate"]},
-                               "outcomes": {"10": true, "11": false}}));
+                               "outcomes": {"10": true, "11": false}}),
+        );
         let history = vec![
             msg(10, "a", &serde_json::to_string(&a).unwrap()),
             msg(11, "b", &serde_json::to_string(&c).unwrap()),
@@ -486,6 +594,9 @@ mod tests {
         let a_loss = cal.mean("a").unwrap();
         assert!((a_loss - (-0.7f64.ln())).abs() < 1e-9, "a loss {a_loss}");
         let b_loss = cal.mean("b").unwrap();
-        assert!((b_loss - (-(1.0f64 - 0.6).ln())).abs() < 1e-9, "b loss {b_loss}");
+        assert!(
+            (b_loss - (-(1.0f64 - 0.6).ln())).abs() < 1e-9,
+            "b loss {b_loss}"
+        );
     }
 }

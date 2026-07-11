@@ -57,6 +57,12 @@ impl Store {
                 created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
             );
 
+            CREATE TABLE IF NOT EXISTS agent_identities (
+                agent_id  TEXT PRIMARY KEY,
+                owner_key TEXT NOT NULL,
+                claimed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+            );
+
             CREATE TABLE IF NOT EXISTS rooms (
                 room_id     TEXT PRIMARY KEY,
                 name        TEXT NOT NULL UNIQUE,
@@ -90,6 +96,11 @@ impl Store {
             -- idx_messages_room_seq is created in Step 2, after the seq migration runs,
             -- because old DBs may not have the seq column at this point.
 
+            CREATE TABLE IF NOT EXISTS room_sequences (
+                room_id    TEXT PRIMARY KEY REFERENCES rooms(room_id) ON DELETE CASCADE,
+                high_water INTEGER NOT NULL DEFAULT 0 CHECK (high_water >= 0)
+            );
+
             CREATE TABLE IF NOT EXISTS agent_sessions (
                 session_id      TEXT PRIMARY KEY,
                 agent_id        TEXT NOT NULL,
@@ -119,6 +130,19 @@ impl Store {
                 option_index INTEGER NOT NULL,
                 cast_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
                 PRIMARY KEY (vote_id, agent_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS room_tasks (
+                task_id     TEXT PRIMARY KEY,
+                room_id     TEXT NOT NULL REFERENCES rooms(room_id) ON DELETE CASCADE,
+                title       TEXT NOT NULL,
+                description TEXT,
+                status      TEXT NOT NULL,
+                assignee    TEXT,
+                created_by  TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT,
+                note        TEXT
             );
 
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -155,10 +179,20 @@ impl Store {
         )?;
 
         // Step 2: Run migrations (add columns to tables that may have been created by older versions)
-        Self::migrate_add_column(&conn, "rooms", "visibility", "TEXT NOT NULL DEFAULT 'private'");
+        Self::migrate_add_column(
+            &conn,
+            "rooms",
+            "visibility",
+            "TEXT NOT NULL DEFAULT 'private'",
+        );
         Self::migrate_add_column(&conn, "rooms", "owner_key", "TEXT");
         Self::migrate_add_column(&conn, "rooms", "encrypted", "INTEGER NOT NULL DEFAULT 0");
-        ensure_column_exists(&conn, "votes", "eligible_voters", "INTEGER NOT NULL DEFAULT 0")?;
+        ensure_column_exists(
+            &conn,
+            "votes",
+            "eligible_voters",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         ensure_column_exists(&conn, "messages", "seq", "INTEGER NOT NULL DEFAULT 0")?;
         // Backfill seq for any existing rows that predate the column. rowid order
         // approximates insertion order, so this gives stable per-room seqs.
@@ -177,6 +211,40 @@ impl Store {
         conn.execute(
             "UPDATE rooms SET visibility = 'public' WHERE room_id = 'lobby' AND visibility = 'private'",
             [],
+        )?;
+
+        // Seed the durable per-room sequence high-water from existing messages.
+        // MAX() is used only during migration; normal allocation never derives
+        // from retained rows, so a full retention purge cannot reset cursors.
+        conn.execute_batch(
+            "INSERT INTO room_sequences (room_id, high_water)
+             SELECT r.room_id, COALESCE(MAX(m.seq), 0)
+             FROM rooms r LEFT JOIN messages m ON m.room_id = r.room_id
+             GROUP BY r.room_id
+             ON CONFLICT(room_id) DO UPDATE SET
+                 high_water = MAX(room_sequences.high_water, excluded.high_water);",
+        )?;
+
+        // Older binaries calculate seq from retained message rows. If one is
+        // started after a full purge, fail its regressed insert instead of
+        // silently reusing a sequence at/below the durable high-water. The
+        // AFTER trigger also bridges safe old-binary inserts into the counter.
+        conn.execute_batch(
+            "CREATE TRIGGER IF NOT EXISTS prevent_message_seq_regression
+             BEFORE INSERT ON messages
+             WHEN NEW.seq <= COALESCE(
+                 (SELECT high_water FROM room_sequences WHERE room_id = NEW.room_id), 0
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'message seq below durable high-water');
+             END;
+             CREATE TRIGGER IF NOT EXISTS advance_message_seq_high_water
+             AFTER INSERT ON messages
+             BEGIN
+                 INSERT INTO room_sequences (room_id, high_water) VALUES (NEW.room_id, NEW.seq)
+                 ON CONFLICT(room_id) DO UPDATE SET
+                     high_water = MAX(room_sequences.high_water, NEW.seq);
+             END;",
         )?;
 
         Ok(())
@@ -203,7 +271,16 @@ impl Store {
         parent_id: Option<&str>,
         created_by: Option<&str>,
     ) -> Result<Room, StoreError> {
-        self.create_room_with_visibility(room_id, name, description, parent_id, created_by, "private", None, false)
+        self.create_room_with_visibility(
+            room_id,
+            name,
+            description,
+            parent_id,
+            created_by,
+            "private",
+            None,
+            false,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -324,23 +401,34 @@ impl Store {
         reply_to_message: Option<&str>,
         metadata: &serde_json::Value,
     ) -> Result<ChatMessage, StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
         let metadata_str = serde_json::to_string(metadata).unwrap_or_default();
 
-        // The seq subquery + INSERT runs as a single SQLite statement under a write
-        // lock, so concurrent inserts in the same room can't collide on seq.
-        conn.execute(
+        // Allocate and insert in one transaction. The AFTER INSERT trigger
+        // advances high-water in the same transaction, so a failed insert cannot
+        // consume a seq. The counter is independent of retained message rows.
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO room_sequences (room_id, high_water) VALUES (?1, 0)",
+            params![room_id],
+        )?;
+        let seq: i64 = tx.query_row(
+            "SELECT high_water + 1 FROM room_sequences WHERE room_id = ?1",
+            params![room_id],
+            |row| row.get(0),
+        )?;
+        tx.execute(
             "INSERT INTO messages (message_id, room_id, agent_id, agent_name, content, reply_to_message, metadata, seq)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7,
-                 COALESCE((SELECT MAX(seq) FROM messages WHERE room_id = ?2), 0) + 1)",
-            params![message_id, room_id, agent_id, agent_name, content, reply_to_message, metadata_str],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![message_id, room_id, agent_id, agent_name, content, reply_to_message, metadata_str, seq],
         )?;
 
-        let (created_at, seq): (String, i64) = conn.query_row(
-            "SELECT created_at, seq FROM messages WHERE message_id = ?1",
+        let created_at: String = tx.query_row(
+            "SELECT created_at FROM messages WHERE message_id = ?1",
             params![message_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )?;
+        tx.commit()?;
 
         Ok(ChatMessage {
             message_id: message_id.to_string(),
@@ -355,11 +443,12 @@ impl Store {
         })
     }
 
-    /// Returns the latest seq for a room, or 0 if the room has no persisted messages.
+    /// Returns the durable high-water seq for a room, or 0 if it has never had
+    /// a persisted message. Retention does not lower this value.
     pub fn room_tip(&self, room_id: &str) -> Result<i64, StoreError> {
         let conn = self.conn.lock().unwrap();
         let seq: i64 = conn.query_row(
-            "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE room_id = ?1",
+            "SELECT COALESCE((SELECT high_water FROM room_sequences WHERE room_id = ?1), 0)",
             params![room_id],
             |row| row.get(0),
         )?;
@@ -489,6 +578,28 @@ impl Store {
         Ok(())
     }
 
+    /// Permanently bind a public agent id to the credential that first claims
+    /// it. Reconnect stash expiry and server restarts must not erase ownership.
+    pub fn claim_agent_identity(
+        &self,
+        agent_id: &str,
+        owner_key: &str,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO agent_identities (agent_id, owner_key) VALUES (?1, ?2)",
+            params![agent_id, owner_key],
+        )?;
+        let stored_key: String = tx.query_row(
+            "SELECT owner_key FROM agent_identities WHERE agent_id = ?1",
+            params![agent_id],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(stored_key == owner_key)
+    }
+
     // --- Vote operations ---
 
     pub fn create_vote(
@@ -582,6 +693,56 @@ impl Store {
         Ok(results)
     }
 
+    pub fn save_task(&self, task: &clawchat_core::TaskInfo) -> Result<(), StoreError> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO room_tasks
+             (task_id, room_id, title, description, status, assignee, created_by, created_at, updated_at, note)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+             ON CONFLICT(task_id) DO UPDATE SET
+               status=excluded.status, assignee=excluded.assignee,
+               updated_at=excluded.updated_at, note=excluded.note",
+            params![
+                task.task_id,
+                task.room_id,
+                task.title,
+                task.description,
+                task.status,
+                task.assignee,
+                task.created_by,
+                task.created_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+                task.updated_at.map(|value| value.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()),
+                task.note,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn load_tasks(&self) -> Result<Vec<clawchat_core::TaskInfo>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT task_id, room_id, title, description, status, assignee,
+                    created_by, created_at, updated_at, note FROM room_tasks",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let created_at: String = row.get(7)?;
+            let updated_at: Option<String> = row.get(8)?;
+            Ok(clawchat_core::TaskInfo {
+                task_id: row.get(0)?,
+                room_id: row.get(1)?,
+                title: row.get(2)?,
+                description: row.get(3)?,
+                status: row.get(4)?,
+                assignee: row.get(5)?,
+                created_by: row.get(6)?,
+                created_at: parse_timestamp(&created_at),
+                updated_at: updated_at.as_deref().map(parse_timestamp),
+                note: row.get(9)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::Db)
+    }
+
     pub fn close_vote(&self, vote_id: &str) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -614,14 +775,16 @@ impl Store {
 
     pub fn get_key_tier(&self, api_key: &str) -> Result<String, StoreError> {
         let conn = self.conn.lock().unwrap();
-        let tier: String = conn.query_row(
-            "SELECT tier FROM api_keys WHERE api_key = ?1",
-            params![api_key],
-            |row| row.get(0),
-        ).map_err(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => StoreError::Db(e),
-            other => StoreError::Db(other),
-        })?;
+        let tier: String = conn
+            .query_row(
+                "SELECT tier FROM api_keys WHERE api_key = ?1",
+                params![api_key],
+                |row| row.get(0),
+            )
+            .map_err(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => StoreError::Db(e),
+                other => StoreError::Db(other),
+            })?;
         Ok(tier)
     }
 
@@ -651,7 +814,9 @@ impl Store {
                      FROM rooms WHERE parent_id = ?1 AND (visibility = 'public' OR owner_key = ?2) ORDER BY name",
                 )?;
                 let rows = stmt.query_map(params![pid, key], map_room_row)?;
-                for row in rows { rooms.push(row?); }
+                for row in rows {
+                    rooms.push(row?);
+                }
             }
             (Some(pid), None) => {
                 let mut stmt = conn.prepare(
@@ -659,7 +824,9 @@ impl Store {
                      FROM rooms WHERE parent_id = ?1 AND visibility = 'public' ORDER BY name",
                 )?;
                 let rows = stmt.query_map(params![pid], map_room_row)?;
-                for row in rows { rooms.push(row?); }
+                for row in rows {
+                    rooms.push(row?);
+                }
             }
             (None, Some(key)) => {
                 let mut stmt = conn.prepare(
@@ -667,7 +834,9 @@ impl Store {
                      FROM rooms WHERE visibility = 'public' OR owner_key = ?1 ORDER BY name",
                 )?;
                 let rows = stmt.query_map(params![key], map_room_row)?;
-                for row in rows { rooms.push(row?); }
+                for row in rows {
+                    rooms.push(row?);
+                }
             }
             (None, None) => {
                 let mut stmt = conn.prepare(
@@ -675,7 +844,9 @@ impl Store {
                      FROM rooms WHERE visibility = 'public' ORDER BY name",
                 )?;
                 let rows = stmt.query_map([], map_room_row)?;
-                for row in rows { rooms.push(row?); }
+                for row in rows {
+                    rooms.push(row?);
+                }
             }
         }
 
@@ -715,6 +886,17 @@ impl Store {
             votes.push(row?);
         }
         Ok(votes)
+    }
+
+    pub fn list_open_votes(&self) -> Result<Vec<VoteMeta>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT vote_id, room_id, title, description, options, created_by,
+                    created_at, closes_at, status, eligible_voters
+             FROM votes WHERE status = 'open' ORDER BY created_at ASC",
+        )?;
+        let rows = stmt.query_map([], map_vote_meta_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::Db)
     }
 
     // --- Subscription operations ---
@@ -925,9 +1107,7 @@ impl Store {
         // Returns true if a new row was inserted, false if a duplicate (sub, seq)
         // was rejected by the UNIQUE constraint (idempotent enqueue).
         let conn = self.conn.lock().unwrap();
-        let ts = next_attempt_at
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let ts = next_attempt_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         match conn.execute(
             "INSERT INTO subscription_deliveries
              (delivery_id, subscription_id, message_seq, message_id, next_attempt_at, attempts)
@@ -954,9 +1134,14 @@ impl Store {
         let ts = now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         let mut stmt = conn.prepare(
             "SELECT delivery_id, subscription_id, message_seq, message_id, attempts
-             FROM subscription_deliveries
+             FROM subscription_deliveries AS candidate
              WHERE next_attempt_at <= ?1
-             ORDER BY next_attempt_at ASC
+               AND NOT EXISTS (
+                   SELECT 1 FROM subscription_deliveries AS earlier
+                   WHERE earlier.subscription_id = candidate.subscription_id
+                     AND earlier.message_seq < candidate.message_seq
+               )
+             ORDER BY next_attempt_at ASC, message_seq ASC
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![ts, limit as i64], |row| {
@@ -1015,9 +1200,7 @@ impl Store {
         last_error: &str,
     ) -> Result<(), StoreError> {
         let conn = self.conn.lock().unwrap();
-        let ts = next_attempt_at
-            .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-            .to_string();
+        let ts = next_attempt_at.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
         conn.execute(
             "UPDATE subscription_deliveries
              SET next_attempt_at = ?1, attempts = ?2, last_error = ?3
@@ -1146,7 +1329,9 @@ fn map_room_row(row: &rusqlite::Row) -> rusqlite::Result<Room> {
         ephemeral: false,
         created_at: parse_timestamp(&row.get::<_, String>(5)?),
         created_by: row.get(4)?,
-        visibility: row.get::<_, String>(6).unwrap_or_else(|_| "private".to_string()),
+        visibility: row
+            .get::<_, String>(6)
+            .unwrap_or_else(|_| "private".to_string()),
         owner_key: row.get(7)?,
         last_activity: None,
         member_count: None,
@@ -1197,11 +1382,10 @@ fn map_message_row(row: &rusqlite::Row) -> rusqlite::Result<ChatMessage> {
 /// Uses rowid order as a stand-in for insertion order. Idempotent.
 fn backfill_message_seq(conn: &Connection) -> Result<(), rusqlite::Error> {
     // Skip if there are no zero-seq rows.
-    let zero_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM messages WHERE seq = 0",
-        [],
-        |row| row.get(0),
-    )?;
+    let zero_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM messages WHERE seq = 0", [], |row| {
+            row.get(0)
+        })?;
     if zero_count == 0 {
         return Ok(());
     }
@@ -1396,7 +1580,15 @@ mod tests {
             .create_room("r1", "purge-room", None, None, None)
             .unwrap();
         store
-            .insert_message("m1", "r1", "a1", "agent", "hello", None, &serde_json::json!({}))
+            .insert_message(
+                "m1",
+                "r1",
+                "a1",
+                "agent",
+                "hello",
+                None,
+                &serde_json::json!({}),
+            )
             .unwrap();
 
         // A freshly-inserted message is inside the 14-day free window — kept.
@@ -1408,5 +1600,269 @@ mod tests {
         // Once the cutoff moves past the message, the free sweep deletes it.
         assert_eq!(store.purge_messages_by_tier("free", "+1 hours").unwrap(), 1);
         assert_eq!(store.get_history("r1", 10, None).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_full_purge_preserves_sequence_and_cursor_recovery() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_room("r1", "retention-room", None, None, None)
+            .unwrap();
+        for seq in 1..=2 {
+            let message = store
+                .insert_message(
+                    &format!("m{seq}"),
+                    "r1",
+                    "agent",
+                    "Agent",
+                    "before purge",
+                    None,
+                    &serde_json::json!({}),
+                )
+                .unwrap();
+            assert_eq!(message.seq, seq);
+        }
+        store
+            .create_subscription(
+                "sub-1",
+                "r1",
+                "owner",
+                "https://example.com/hook",
+                "secret",
+                &[],
+                None,
+                None,
+                false,
+                2,
+            )
+            .unwrap();
+
+        assert_eq!(store.purge_messages_by_tier("free", "+1 hours").unwrap(), 2);
+        assert_eq!(store.get_history("r1", 10, None).unwrap().len(), 0);
+        assert_eq!(store.room_tip("r1").unwrap(), 2);
+
+        let after = store
+            .insert_message(
+                "m3",
+                "r1",
+                "agent",
+                "Agent",
+                "after purge",
+                None,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(after.seq, 3);
+        let resumed = store
+            .get_history_filtered("r1", 10, None, None, Some(2))
+            .unwrap();
+        assert_eq!(resumed.iter().map(|m| m.seq).collect::<Vec<_>>(), vec![3]);
+
+        let subscription = store.get_subscription("sub-1").unwrap().unwrap().0;
+        assert_eq!(subscription.last_delivered_seq, 2);
+        assert!(store
+            .enqueue_delivery(
+                "delivery-3",
+                "sub-1",
+                after.seq,
+                &after.message_id,
+                chrono::Utc::now(),
+            )
+            .unwrap());
+        let due = store.load_due_deliveries(chrono::Utc::now(), 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].message_seq, 3);
+    }
+
+    #[test]
+    fn test_due_webhook_deliveries_are_serialized_per_subscription() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .create_subscription(
+                "ordered-sub",
+                "lobby",
+                "owner",
+                "https://example.com/hook",
+                "secret",
+                &[],
+                None,
+                None,
+                false,
+                0,
+            )
+            .unwrap();
+        let now = chrono::Utc::now();
+        store
+            .enqueue_delivery("delivery-2", "ordered-sub", 2, "message-2", now)
+            .unwrap();
+        store
+            .enqueue_delivery("delivery-1", "ordered-sub", 1, "message-1", now)
+            .unwrap();
+        let due = store.load_due_deliveries(now, 10).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].message_seq, 1);
+        store.delete_delivery("delivery-1").unwrap();
+        let next = store.load_due_deliveries(now, 10).unwrap();
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].message_seq, 2);
+    }
+
+    #[test]
+    fn test_sequence_high_water_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clawchat.db");
+        {
+            let store = Store::open(&path).unwrap();
+            for seq in 1..=2 {
+                let message = store
+                    .insert_message(
+                        &format!("m{seq}"),
+                        "lobby",
+                        "agent",
+                        "Agent",
+                        "before restart",
+                        None,
+                        &serde_json::json!({}),
+                    )
+                    .unwrap();
+                assert_eq!(message.seq, seq);
+            }
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(store.room_tip("lobby").unwrap(), 2);
+            assert_eq!(store.purge_messages_by_tier("free", "+1 hours").unwrap(), 2);
+            let message = store
+                .insert_message(
+                    "m3",
+                    "lobby",
+                    "agent",
+                    "Agent",
+                    "after restart and purge",
+                    None,
+                    &serde_json::json!({}),
+                )
+                .unwrap();
+            assert_eq!(message.seq, 3);
+        }
+    }
+
+    #[test]
+    fn test_agent_identity_ownership_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("identity.db");
+        {
+            let store = Store::open(&path).unwrap();
+            assert!(store.claim_agent_identity("stable-agent", "key-a").unwrap());
+        }
+        let store = Store::open(&path).unwrap();
+        assert!(store.claim_agent_identity("stable-agent", "key-a").unwrap());
+        assert!(!store.claim_agent_identity("stable-agent", "key-b").unwrap());
+    }
+
+    #[test]
+    fn test_old_style_insert_fails_after_full_purge_instead_of_regressing_seq() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .insert_message(
+                "before-purge",
+                "lobby",
+                "agent",
+                "Agent",
+                "before",
+                None,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(store.purge_messages_by_tier("free", "+1 hours").unwrap(), 1);
+
+        // Simulate the INSERT emitted by an older binary, which derives 1 from
+        // MAX(messages) after retention deleted every row and does not advance
+        // room_sequences first. The compatibility trigger must fail closed.
+        let conn = store.conn.lock().unwrap();
+        let result = conn.execute(
+            "INSERT INTO messages
+             (message_id, room_id, agent_id, agent_name, content, metadata, seq)
+             VALUES ('old-binary', 'lobby', 'agent', 'Agent', 'unsafe', '{}', 1)",
+            [],
+        );
+        assert!(result.is_err(), "a downgraded insert must not regress seq");
+        drop(conn);
+        assert_eq!(store.room_tip("lobby").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_concurrent_sequence_allocation_is_unique_and_monotonic() {
+        let store = std::sync::Arc::new(Store::open_in_memory().unwrap());
+        let workers = (0..24)
+            .map(|index| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store
+                        .insert_message(
+                            &format!("concurrent-{index}"),
+                            "lobby",
+                            "agent",
+                            "Agent",
+                            "concurrent",
+                            None,
+                            &serde_json::json!({}),
+                        )
+                        .unwrap()
+                        .seq
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut sequences = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        sequences.sort_unstable();
+        assert_eq!(sequences, (1..=24).collect::<Vec<_>>());
+        assert_eq!(store.room_tip("lobby").unwrap(), 24);
+    }
+
+    #[test]
+    fn test_sequence_migration_seeds_existing_maximum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE rooms (
+                    room_id TEXT PRIMARY KEY, name TEXT NOT NULL UNIQUE,
+                    description TEXT, parent_id TEXT, created_by TEXT,
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    visibility TEXT NOT NULL DEFAULT 'private', owner_key TEXT,
+                    encrypted INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE TABLE messages (
+                    message_id TEXT PRIMARY KEY, room_id TEXT NOT NULL,
+                    agent_id TEXT NOT NULL, agent_name TEXT NOT NULL,
+                    content TEXT NOT NULL, reply_to_message TEXT, metadata TEXT DEFAULT '{}',
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                    seq INTEGER NOT NULL DEFAULT 0
+                 );
+                 INSERT INTO rooms (room_id, name, visibility) VALUES ('legacy', 'legacy', 'public');
+                 INSERT INTO messages (message_id, room_id, agent_id, agent_name, content, seq)
+                    VALUES ('old-7', 'legacy', 'a', 'A', 'old', 7),
+                           ('old-9', 'legacy', 'a', 'A', 'old', 9);",
+            )
+            .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(store.room_tip("legacy").unwrap(), 9);
+        let message = store
+            .insert_message(
+                "new-10",
+                "legacy",
+                "a",
+                "A",
+                "new",
+                None,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(message.seq, 10);
     }
 }

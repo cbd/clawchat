@@ -103,7 +103,10 @@ fn format_message(msg: &ChatMessage) -> String {
     let ts = msg.timestamp.format("%H:%M:%S");
     let is_system = msg.metadata.get("type").and_then(|v| v.as_str()) == Some("system");
     if is_system {
-        format!("[{}] #{} * {} {} *", ts, msg.seq, msg.agent_name, msg.content)
+        format!(
+            "[{}] #{} * {} {} *",
+            ts, msg.seq, msg.agent_name, msg.content
+        )
     } else {
         format!("[{}] #{} {}: {}", ts, msg.seq, msg.agent_name, msg.content)
     }
@@ -252,6 +255,11 @@ enum Commands {
         /// discipline — the agent makes one call and gets one message back.
         #[arg(long = "loop")]
         loop_: bool,
+        /// Keep streaming messages until interrupted or a conversation_end is
+        /// received. Uses a durable cursor, reconnects with backoff, and emits
+        /// every matching message instead of returning after the first one.
+        #[arg(long)]
+        follow: bool,
         /// Bound the total wall-clock of a `--loop` wait (seconds). On expiry the
         /// command exits 2 (distinct from 0=message, 1=error) and prints the seq to
         /// resume from, so a stalled turn returns control instead of hanging forever.
@@ -368,9 +376,9 @@ enum Commands {
         action: ElectionAction,
     },
 
-    /// Set agent presence status (idle, waiting, working)
+    /// Set agent presence status (idle, waiting, working, thinking)
     Presence {
-        /// Status: idle, waiting, or working
+        /// Status: idle, waiting, working, or thinking
         status: String,
         /// Human-readable detail, e.g. "reviewing section 3"
         #[arg(long)]
@@ -658,13 +666,9 @@ enum SubAction {
         room: Option<String>,
     },
     /// Delete a subscription.
-    Delete {
-        subscription_id: String,
-    },
+    Delete { subscription_id: String },
     /// Re-enable a `failed` subscription. Replays the backlog past the cursor.
-    Enable {
-        subscription_id: String,
-    },
+    Enable { subscription_id: String },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -772,6 +776,197 @@ async fn resolve_room_id(
         [single] => Ok(single.room_id.clone()),
         [] => Err(format!("Room '{room}' not found (expected ID or exact name)").into()),
         _ => Err(format!("Room name '{room}' is ambiguous; use the room ID").into()),
+    }
+}
+
+fn write_cursor_atomic(path: &std::path::Path, seq: i64) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("cursor");
+    let temporary = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+    std::fs::write(&temporary, seq.to_string())?;
+    std::fs::rename(temporary, path)
+}
+
+fn advance_cursor(
+    cursor: &mut Option<i64>,
+    cursor_file: Option<&PathBuf>,
+    seq: i64,
+) -> Result<(), ClientError> {
+    if let Some(path) = cursor_file {
+        write_cursor_atomic(path, seq).map_err(ClientError::Io)?;
+    }
+    *cursor = Some(seq);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_wait_follow(
+    cli: &Cli,
+    room: &str,
+    since_seq: Option<&str>,
+    heartbeat_secs: u64,
+    only_from: Option<&String>,
+    not_from: Option<&String>,
+    only_kind: Option<&String>,
+    show_thinking: bool,
+    text: bool,
+    output: Option<&PathBuf>,
+    cursor_file: Option<&PathBuf>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut cursor = cursor_file
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let mut backoff = 1u64;
+    let started = std::time::Instant::now();
+    let mut last_heartbeat = std::time::Instant::now();
+
+    loop {
+        let client = match connect(cli).await {
+            Ok(client) => client,
+            Err(error) => {
+                eprintln!("wait --follow: connect failed: {error}; retrying in {backoff}s");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(30);
+                continue;
+            }
+        };
+        let room_id = match resolve_room_id(&client, room).await {
+            Ok(id) => id,
+            Err(error) => {
+                eprintln!("wait --follow: room lookup failed: {error}; retrying in {backoff}s");
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                backoff = (backoff * 2).min(30);
+                continue;
+            }
+        };
+        if cursor.is_none() {
+            cursor = match since_seq {
+                None => match client.room_tip(&room_id).await {
+                    Ok(tip) => Some(tip),
+                    Err(error) => {
+                        eprintln!(
+                            "wait --follow: tip lookup failed: {error}; retrying in {backoff}s"
+                        );
+                        tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                        backoff = (backoff * 2).min(30);
+                        continue;
+                    }
+                },
+                Some(s) if s.eq_ignore_ascii_case("tip") || s.eq_ignore_ascii_case("auto") => {
+                    match client.room_tip(&room_id).await {
+                        Ok(tip) => Some(tip),
+                        Err(error) => {
+                            eprintln!(
+                                "wait --follow: tip lookup failed: {error}; retrying in {backoff}s"
+                            );
+                            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                            backoff = (backoff * 2).min(30);
+                            continue;
+                        }
+                    }
+                }
+                Some(s) => Some(s.parse::<i64>().map_err(|e| {
+                    format!("--since-seq must be an integer, 'tip', or 'auto': {e}")
+                })?),
+            };
+        }
+        if let Err(error) = client.join_room(&room_id).await {
+            eprintln!("wait --follow: join failed: {error}; retrying in {backoff}s");
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
+            continue;
+        }
+        let _ = client.set_presence("waiting", None, None).await;
+        backoff = 1;
+
+        let connection_result: Result<(), ClientError> = async {
+            loop {
+                // Pulling history before waiting makes the cursor authoritative
+                // across disconnects and broadcast lag. Advance over filtered,
+                // self, thinking, and system rows too, so none can pin recovery.
+                let mut batch = client
+                    .get_history_filtered(&room_id, 500, None, None, cursor)
+                    .await?;
+                batch.sort_by_key(|message| message.seq);
+                if batch.is_empty() {
+                    if let Some(message) = client.wait_for_message(&room_id, 5, cursor).await? {
+                        batch.push(message);
+                    }
+                }
+
+                for message in batch {
+                    if cursor.is_some_and(|seq| message.seq <= seq) {
+                        continue;
+                    }
+                    let row_type = message.metadata.get("type").and_then(|v| v.as_str());
+                    if row_type == Some("thinking") {
+                        if show_thinking && !client.is_self_message(&message) {
+                            eprintln!("wait: thinking {}: {}", message.agent_name, message.content);
+                        }
+                        advance_cursor(&mut cursor, cursor_file, message.seq)?;
+                        continue;
+                    }
+                    if row_type == Some("system") || client.is_self_message(&message) {
+                        advance_cursor(&mut cursor, cursor_file, message.seq)?;
+                        continue;
+                    }
+                    if only_from.is_some_and(|name| message.agent_name != *name)
+                        || not_from.is_some_and(|name| message.agent_name == *name)
+                        || only_kind.is_some_and(|kind| {
+                            message.metadata.get("kind").and_then(|v| v.as_str())
+                                != Some(kind.as_str())
+                        })
+                    {
+                        advance_cursor(&mut cursor, cursor_file, message.seq)?;
+                        continue;
+                    }
+
+                    let rendered = if text {
+                        format_message(&message)
+                    } else {
+                        serde_json::to_string(&message).unwrap_or_default()
+                    };
+                    if let Some(path) = output {
+                        let mut file = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                            .map_err(ClientError::Io)?;
+                        writeln!(file, "{rendered}").map_err(ClientError::Io)?;
+                    } else {
+                        println!("{rendered}");
+                    }
+                    advance_cursor(&mut cursor, cursor_file, message.seq)?;
+                    if message.metadata.get("kind").and_then(|v| v.as_str())
+                        == Some(KIND_CONVERSATION_END)
+                    {
+                        eprintln!("Peer ended the conversation.");
+                        std::process::exit(3);
+                    }
+                }
+
+                if heartbeat_secs > 0
+                    && last_heartbeat.elapsed() >= std::time::Duration::from_secs(heartbeat_secs)
+                {
+                    eprintln!(
+                        "wait: alive {}s room={} since_seq={} mode=follow",
+                        started.elapsed().as_secs(),
+                        room_id,
+                        cursor.unwrap_or(0)
+                    );
+                    last_heartbeat = std::time::Instant::now();
+                }
+            }
+        }
+        .await;
+        let _ = client.set_presence("idle", None, None).await;
+        if let Err(error) = connection_result {
+            eprintln!("wait --follow: connection lost: {error}; retrying in {backoff}s");
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
+        }
     }
 }
 
@@ -918,8 +1113,8 @@ async fn run_shell(
                                         println!("No agents connected.");
                                     } else {
                                         println!(
-                                            "{:<38} {:<16} {:<10} {:<10} {}",
-                                            "AGENT ID", "NAME", "STATUS", "PROGRESS", "DETAIL"
+                                            "{:<38} {:<16} {:<10} {:<10} DETAIL",
+                                            "AGENT ID", "NAME", "STATUS", "PROGRESS"
                                         );
                                         println!("{}", "-".repeat(100));
                                         for agent in agents {
@@ -1082,7 +1277,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if rooms.is_empty() {
                         println!("No rooms found.");
                     } else {
-                        println!("{:<38} {:<20} {:<10} {:<8} {:<20} DESCRIPTION", "ID", "NAME", "TYPE", "MEMBERS", "LAST ACTIVITY");
+                        println!(
+                            "{:<38} {:<20} {:<10} {:<8} {:<20} DESCRIPTION",
+                            "ID", "NAME", "TYPE", "MEMBERS", "LAST ACTIVITY"
+                        );
                         println!("{}", "-".repeat(130));
                         for room in rooms {
                             let room_type = if room.ephemeral {
@@ -1091,8 +1289,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "permanent"
                             };
                             let desc = room.description.as_deref().unwrap_or("");
-                            let members = room.member_count.map(|c| c.to_string()).unwrap_or_else(|| "-".to_string());
-                            let activity = room.last_activity
+                            let members = room
+                                .member_count
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "-".to_string());
+                            let activity = room
+                                .last_activity
                                 .map(|t| t.format("%H:%M:%S").to_string())
                                 .unwrap_or_else(|| "-".to_string());
                             println!(
@@ -1167,14 +1369,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Option<String>,
             ) = if let Some(r) = room {
                 let room_id = resolve_room_id(&client, r).await?;
-                let hist = client.get_history(&room_id, 200, None).await.unwrap_or_default();
+                let hist = client
+                    .get_history(&room_id, 200, None)
+                    .await
+                    .unwrap_or_default();
                 let mut map = std::collections::HashMap::new();
                 for m in hist.iter().rev() {
                     // Iterate newest-first; keep first sighting per agent_name.
-                    map.entry(m.agent_name.clone()).or_insert((
-                        m.seq,
-                        m.timestamp.format("%H:%M:%S").to_string(),
-                    ));
+                    map.entry(m.agent_name.clone())
+                        .or_insert((m.seq, m.timestamp.format("%H:%M:%S").to_string()));
                 }
                 (map, Some(room_id))
             } else {
@@ -1190,21 +1393,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 if show_room_activity {
                     println!(
-                        "{:<10} {:<38} {:<16} {:<10} {:<8} {:<10} {:<10} {}",
-                        "STATE",
-                        "AGENT ID",
-                        "NAME",
-                        "STATUS",
-                        "PROG",
-                        "ACTIVE",
-                        "LAST_SEQ",
-                        "DETAIL"
+                        "{:<10} {:<38} {:<16} {:<10} {:<8} {:<10} {:<10} DETAIL",
+                        "STATE", "AGENT ID", "NAME", "STATUS", "PROG", "ACTIVE", "LAST_SEQ"
                     );
                     println!("{}", "-".repeat(130));
                 } else {
                     println!(
-                        "{:<38} {:<16} {:<10} {:<8} {:<10} {}",
-                        "AGENT ID", "NAME", "STATUS", "PROG", "ACTIVE", "DETAIL"
+                        "{:<38} {:<16} {:<10} {:<8} {:<10} DETAIL",
+                        "AGENT ID", "NAME", "STATUS", "PROG", "ACTIVE"
                     );
                     println!("{}", "-".repeat(110));
                 }
@@ -1222,11 +1418,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| "-".to_string());
                     let detail = agent.status_detail.as_deref().unwrap_or("");
                     if show_room_activity {
-                        let (last_seq_s, _last_ts_s) =
-                            last_in_room.get(&agent.name).cloned().unwrap_or((
-                                0,
-                                "-".to_string(),
-                            ));
+                        let (last_seq_s, _last_ts_s) = last_in_room
+                            .get(&agent.name)
+                            .cloned()
+                            .unwrap_or((0, "-".to_string()));
                         let last_seq = if last_seq_s > 0 {
                             format!("#{}", last_seq_s)
                         } else {
@@ -1234,7 +1429,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         println!(
                             "{:<10} {:<38} {:<16} {:<10} {:<8} {:<10} {:<10} {}",
-                            "LIVE", agent.agent_id, agent.name, status, progress, active, last_seq, detail
+                            "LIVE",
+                            agent.agent_id,
+                            agent.name,
+                            status,
+                            progress,
+                            active,
+                            last_seq,
+                            detail
                         );
                     } else {
                         println!(
@@ -1253,15 +1455,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         println!(
-                            "{:<10} {:<38} {:<16} {:<10} {:<8} {:<10} {:<10} {}",
+                            "{:<10} {:<38} {:<16} {:<10} {:<8} {:<10} {:<10} (last seen via history)",
                             "RECENT",
                             "-",
                             name,
                             "-",
                             "",
                             ts,
-                            format!("#{}", seq),
-                            "(last seen via history)"
+                            format!("#{}", seq)
                         );
                     }
                 }
@@ -1289,9 +1490,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let filtered: Vec<&ChatMessage> = messages
                 .iter()
                 .filter(|m| match kind {
-                    Some(k) => {
-                        m.metadata.get("kind").and_then(|v| v.as_str()) == Some(k.as_str())
-                    }
+                    Some(k) => m.metadata.get("kind").and_then(|v| v.as_str()) == Some(k.as_str()),
                     None => true,
                 })
                 .collect();
@@ -1366,6 +1565,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             text,
             since_seq,
             loop_,
+            follow,
             idle_timeout,
             heartbeat_secs,
             only_from,
@@ -1376,6 +1576,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             drain,
             cursor_file,
         } => {
+            if *follow {
+                run_wait_follow(
+                    &cli,
+                    room,
+                    since_seq.as_deref(),
+                    *heartbeat_secs,
+                    only_from.as_ref(),
+                    not_from.as_ref(),
+                    only_kind.as_ref(),
+                    *show_thinking,
+                    *text,
+                    output.as_ref(),
+                    cursor_file.as_ref(),
+                )
+                .await?;
+                return Ok(());
+            }
             let client = connect(&cli).await?;
             let room_id = resolve_room_id(&client, room).await?;
             let _ = client.join_room(&room_id).await;
@@ -1428,9 +1645,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mode_label = if *loop_ { "loop" } else { "once" };
                 Some(tokio::spawn(async move {
                     let started = std::time::Instant::now();
-                    let mut tick = tokio::time::interval(
-                        std::time::Duration::from_secs(interval),
-                    );
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval));
                     tick.tick().await; // skip the immediate first tick
                     loop {
                         tick.tick().await;
@@ -1457,11 +1672,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let room_label = room_id.clone();
                 Some(tokio::spawn(async move {
                     while let Ok(evt) = events.recv().await {
-                        let in_room = evt
-                            .frame
-                            .payload
-                            .get("room_id")
-                            .and_then(|v| v.as_str())
+                        let in_room = evt.frame.payload.get("room_id").and_then(|v| v.as_str())
                             == Some(room_label.as_str());
                         if !in_room {
                             continue;
@@ -1509,9 +1720,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             continue;
                         }
                         let p = &evt.frame.payload;
-                        if p.get("room_id").and_then(|v| v.as_str())
-                            != Some(room_label.as_str())
-                        {
+                        if p.get("room_id").and_then(|v| v.as_str()) != Some(room_label.as_str()) {
                             continue;
                         }
                         let name = p.get("agent_name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -1556,9 +1765,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // select! may drop) so the idle-expiry path can print an accurate
             // resume point even after filters advanced past some messages.
             // i64::MIN is the "never advanced" sentinel (resume from `tip`).
-            let latest_seq = std::sync::atomic::AtomicI64::new(
-                resolved_since_seq.unwrap_or(i64::MIN),
-            );
+            let latest_seq =
+                std::sync::atomic::AtomicI64::new(resolved_since_seq.unwrap_or(i64::MIN));
             let wait_loop = async {
                 let mut cursor = resolved_since_seq;
                 loop {
@@ -1649,7 +1857,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // our own posts.
                         all.retain(|m| {
                             let t = m.metadata.get("type").and_then(|v| v.as_str());
-                            t != Some("thinking") && t != Some("system") && m.agent_name != cli.name
+                            t != Some("thinking")
+                                && t != Some("system")
+                                && !client.is_self_message(m)
                         });
                         // Ephemeral rooms don't persist history, so the wake
                         // message may be absent — include it exactly once.
@@ -1688,7 +1898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // never our own sent seq, only what we received.
                     let tip_seq = batch.last().map(|m| m.seq).unwrap_or(msg.seq);
                     if let Some(path) = cursor_file {
-                        if let Err(e) = std::fs::write(path, tip_seq.to_string()) {
+                        if let Err(e) = write_cursor_atomic(path, tip_seq) {
                             eprintln!(
                                 "warning: failed to write cursor file {}: {e}",
                                 path.display()
@@ -1702,7 +1912,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // If any message in the batch ended the conversation, stop the
                     // loop (exit 3) instead of waiting for another turn.
                     if batch.iter().any(|m| {
-                        m.metadata.get("kind").and_then(|v| v.as_str()) == Some(KIND_CONVERSATION_END)
+                        m.metadata.get("kind").and_then(|v| v.as_str())
+                            == Some(KIND_CONVERSATION_END)
                     }) {
                         eprintln!("Peer ended the conversation.");
                         std::process::exit(3);
@@ -1790,11 +2001,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match output {
                 Some(path) => {
                     std::fs::write(path, body)?;
-                    eprintln!(
-                        "wrote {} messages to {}",
-                        messages.len(),
-                        path.display()
-                    );
+                    eprintln!("wrote {} messages to {}", messages.len(), path.display());
                 }
                 None => {
                     print!("{}", body);
@@ -1992,7 +2199,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let client = connect(&cli).await?;
             client
-                .set_presence(&status, detail.as_deref(), *progress)
+                .set_presence(status, detail.as_deref(), *progress)
                 .await?;
             let mut msg = format!("Presence set to: {}", status);
             if let Some(p) = progress {
@@ -2055,12 +2262,20 @@ async fn lantern_history(
 ) -> Result<Vec<ChatMessage>, Box<dyn std::error::Error>> {
     let client = connect(cli).await?;
     let room_id = resolve_room_id(&client, room).await?;
-    Ok(client.get_history_filtered(&room_id, 1000, None, None, None).await?)
+    Ok(client
+        .get_history_filtered(&room_id, 1000, None, None, None)
+        .await?)
 }
 
 async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn std::error::Error>> {
     match action {
-        LanternAction::Hello { room, provider, model, role, capabilities } => {
+        LanternAction::Hello {
+            room,
+            provider,
+            model,
+            role,
+            capabilities,
+        } => {
             let caps = capabilities
                 .iter()
                 .map(|c| {
@@ -2071,15 +2286,37 @@ async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn st
                     }
                 })
                 .collect();
-            let hello = lantern::Hello::new(&cli.name, provider.clone(), model.clone(), role.clone(), caps);
+            let hello = lantern::Hello::new(
+                &cli.name,
+                provider.clone(),
+                model.clone(),
+                role.clone(),
+                caps,
+            );
             lantern_send(cli, room, serde_json::to_value(hello)?, false).await?;
         }
-        LanternAction::Probe { room, question, intent } => {
-            let env = lantern::Envelope::new("PROBE", &cli.name, None, None, intent.clone(),
-                serde_json::json!({ "question": question }));
+        LanternAction::Probe {
+            room,
+            question,
+            intent,
+        } => {
+            let env = lantern::Envelope::new(
+                "PROBE",
+                &cli.name,
+                None,
+                None,
+                intent.clone(),
+                serde_json::json!({ "question": question }),
+            );
             lantern_send(cli, room, serde_json::to_value(env)?, true).await?;
         }
-        LanternAction::Assert { room, claim, confidence, falsifiable_by, intent } => {
+        LanternAction::Assert {
+            room,
+            claim,
+            confidence,
+            falsifiable_by,
+            intent,
+        } => {
             let mut body = serde_json::json!({ "claim": claim, "falsifiable_by": falsifiable_by });
             if let Some(c) = confidence {
                 body["confidence"] = serde_json::json!(c);
@@ -2087,17 +2324,48 @@ async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn st
             let env = lantern::Envelope::new("ASSERT", &cli.name, None, None, intent.clone(), body);
             lantern_send(cli, room, serde_json::to_value(env)?, true).await?;
         }
-        LanternAction::Challenge { room, thread, target_seq, counter_claim, confidence, test } => {
-            let env = lantern::Envelope::new("CHALLENGE", &cli.name, Some(*thread), Some(*target_seq), None,
-                serde_json::json!({ "target_seq": target_seq, "counter_claim": counter_claim, "confidence": confidence, "test": test }));
+        LanternAction::Challenge {
+            room,
+            thread,
+            target_seq,
+            counter_claim,
+            confidence,
+            test,
+        } => {
+            let env = lantern::Envelope::new(
+                "CHALLENGE",
+                &cli.name,
+                Some(*thread),
+                Some(*target_seq),
+                None,
+                serde_json::json!({ "target_seq": target_seq, "counter_claim": counter_claim, "confidence": confidence, "test": test }),
+            );
             lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
         }
-        LanternAction::Resolve { room, thread, observation, basis } => {
-            let env = lantern::Envelope::new("RESOLVE", &cli.name, Some(*thread), None, None,
-                serde_json::json!({ "observation": observation, "basis": basis }));
+        LanternAction::Resolve {
+            room,
+            thread,
+            observation,
+            basis,
+        } => {
+            let env = lantern::Envelope::new(
+                "RESOLVE",
+                &cli.name,
+                Some(*thread),
+                None,
+                None,
+                serde_json::json!({ "observation": observation, "basis": basis }),
+            );
             lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
         }
-        LanternAction::Fuse { room, thread, synthesis, state_delta, split, outcomes } => {
+        LanternAction::Fuse {
+            room,
+            thread,
+            synthesis,
+            state_delta,
+            split,
+            outcomes,
+        } => {
             let mut body = serde_json::json!({ "synthesis": synthesis, "split": split });
             if let Some(path) = state_delta {
                 let raw = std::fs::read_to_string(path)?;
@@ -2106,16 +2374,25 @@ async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn st
             if !outcomes.is_empty() {
                 let mut map = serde_json::Map::new();
                 for o in outcomes {
-                    let (seq, verdict) = o.split_once('=')
-                        .ok_or_else(|| format!("--outcome must be <seq>=<true|false>, got `{o}`"))?;
-                    map.insert(seq.trim().to_string(), serde_json::json!(verdict.trim().parse::<bool>()?));
+                    let (seq, verdict) = o.split_once('=').ok_or_else(|| {
+                        format!("--outcome must be <seq>=<true|false>, got `{o}`")
+                    })?;
+                    map.insert(
+                        seq.trim().to_string(),
+                        serde_json::json!(verdict.trim().parse::<bool>()?),
+                    );
                 }
                 body["outcomes"] = serde_json::Value::Object(map);
             }
             let env = lantern::Envelope::new("FUSE", &cli.name, Some(*thread), None, None, body);
             lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
         }
-        LanternAction::Sync { room, thread, state_hash, diff } => {
+        LanternAction::Sync {
+            room,
+            thread,
+            state_hash,
+            diff,
+        } => {
             let mut body = serde_json::json!({});
             if let Some(h) = state_hash {
                 body["state_hash"] = serde_json::json!(h);
@@ -2126,19 +2403,50 @@ async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn st
             let env = lantern::Envelope::new("SYNC", &cli.name, *thread, None, None, body);
             lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
         }
-        LanternAction::Spark { room, seed, why_now, smallest_test } => {
-            let env = lantern::Envelope::new("SPARK", &cli.name, None, None, None,
-                serde_json::json!({ "seed": seed, "why_now": why_now, "smallest_test": smallest_test }));
+        LanternAction::Spark {
+            room,
+            seed,
+            why_now,
+            smallest_test,
+        } => {
+            let env = lantern::Envelope::new(
+                "SPARK",
+                &cli.name,
+                None,
+                None,
+                None,
+                serde_json::json!({ "seed": seed, "why_now": why_now, "smallest_test": smallest_test }),
+            );
             lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
         }
-        LanternAction::Harvest { room, spark_seq, becomes } => {
-            let env = lantern::Envelope::new("HARVEST", &cli.name, None, Some(*spark_seq), None,
-                serde_json::json!({ "spark_seq": spark_seq, "becomes": becomes }));
+        LanternAction::Harvest {
+            room,
+            spark_seq,
+            becomes,
+        } => {
+            let env = lantern::Envelope::new(
+                "HARVEST",
+                &cli.name,
+                None,
+                Some(*spark_seq),
+                None,
+                serde_json::json!({ "spark_seq": spark_seq, "becomes": becomes }),
+            );
             lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
         }
-        LanternAction::Bury { room, spark_seq, reason } => {
-            let env = lantern::Envelope::new("BURY", &cli.name, None, Some(*spark_seq), None,
-                serde_json::json!({ "spark_seq": spark_seq, "reason": reason }));
+        LanternAction::Bury {
+            room,
+            spark_seq,
+            reason,
+        } => {
+            let env = lantern::Envelope::new(
+                "BURY",
+                &cli.name,
+                None,
+                Some(*spark_seq),
+                None,
+                serde_json::json!({ "spark_seq": spark_seq, "reason": reason }),
+            );
             lantern_send(cli, room, serde_json::to_value(env)?, false).await?;
         }
         LanternAction::Threads { room } => {
@@ -2152,8 +2460,18 @@ async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn st
                         .flatten()
                         .collect::<Vec<_>>()
                         .join(" / ");
-                    let caps = h.capabilities.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", ");
-                    println!("  #{seq} {} — {} [{}]", h.agent_name, if who.is_empty() { "?".into() } else { who }, caps);
+                    let caps = h
+                        .capabilities
+                        .iter()
+                        .map(|c| c.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    println!(
+                        "  #{seq} {} — {} [{}]",
+                        h.agent_name,
+                        if who.is_empty() { "?".into() } else { who },
+                        caps
+                    );
                 }
                 println!();
             }
@@ -2168,11 +2486,20 @@ async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn st
                     lantern::ThreadState::Resolved => "resolved",
                     lantern::ThreadState::Fused => "fused",
                 };
-                println!("{:<8} {:<9} {:<8} {}", t.id, state, t.messages.len(), t.headline());
+                println!(
+                    "{:<8} {:<9} {:<8} {}",
+                    t.id,
+                    state,
+                    t.messages.len(),
+                    t.headline()
+                );
             }
             // Surface the REFRACTION-due nudge (every third FUSE across the room).
-            if rec.fuse_count > 0 && rec.fuse_count % 3 == 0 {
-                eprintln!("note: {} FUSEs — the next FUSE is REFRACTION-due (non-author picks the lens).", rec.fuse_count);
+            if rec.fuse_count > 0 && rec.fuse_count.is_multiple_of(3) {
+                eprintln!(
+                    "note: {} FUSEs — the next FUSE is REFRACTION-due (non-author picks the lens).",
+                    rec.fuse_count
+                );
             }
         }
         LanternAction::Show { room, thread } => {
@@ -2181,7 +2508,11 @@ async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn st
                 None => println!("No thread {thread} in this room."),
                 Some(t) => {
                     for m in &t.messages {
-                        let intent = m.intent.as_deref().map(|i| format!("  // {i}")).unwrap_or_default();
+                        let intent = m
+                            .intent
+                            .as_deref()
+                            .map(|i| format!("  // {i}"))
+                            .unwrap_or_default();
                         println!("#{} {} {}{}", m.seq, m.from, m.verb, intent);
                         println!("    {}", serde_json::to_string(&m.body).unwrap_or_default());
                     }
@@ -2196,7 +2527,11 @@ async fn lantern_cmd(cli: &Cli, action: &LanternAction) -> Result<(), Box<dyn st
             }
             println!("Committed shared-state deltas (in FUSE order):");
             for (i, d) in rec.shared_state.iter().enumerate() {
-                println!("  {}. {}", i + 1, serde_json::to_string(d).unwrap_or_default());
+                println!(
+                    "  {}. {}",
+                    i + 1,
+                    serde_json::to_string(d).unwrap_or_default()
+                );
             }
         }
         LanternAction::Calibration { room } => {

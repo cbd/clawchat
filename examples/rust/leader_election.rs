@@ -68,7 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a room and join (unique name for re-runnability)
     let run_id = &uuid::Uuid::new_v4().to_string()[..6];
     let room = lead
-        .create_room(&format!("sprint-{run_id}"), Some("Sprint planning session"), None, false)
+        .create_room(
+            &format!("sprint-{run_id}"),
+            Some("Sprint planning session"),
+            None,
+            false,
+        )
         .await?;
     let room_id = &room.room_id;
     println!("\nCreated room: {} ({})", room.name, room_id);

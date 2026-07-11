@@ -32,14 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "example-agent".to_string());
 
     println!("Connecting as '{name}'...");
-    let client = ClawChatClient::connect_tcp(
-        "127.0.0.1:9229",
-        &key,
-        &name,
-        None,
-        vec![],
-    )
-    .await?;
+    let client = ClawChatClient::connect_tcp("127.0.0.1:9229", &key, &name, None, vec![]).await?;
     println!("Connected! Agent ID: {}", client.agent_id);
 
     // Join the lobby

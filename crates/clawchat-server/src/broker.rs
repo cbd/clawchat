@@ -94,7 +94,9 @@ impl Broker {
         }
     }
 
-    /// Send a mention notification to specific agents, even if not in the room.
+    /// Send a mention notification only to current room members. A client may
+    /// submit arbitrary public agent ids, but must not exfiltrate private room
+    /// content by mentioning an outsider.
     pub fn send_mentions(&self, mentions: &[String], message: &ChatMessage, room_id: &str) {
         let frame = Frame::event(
             FrameType::Mention,
@@ -105,15 +107,22 @@ impl Broker {
         );
 
         for agent_id in mentions {
-            self.send_to_agent(agent_id, frame.clone());
+            if self.is_agent_in_room(agent_id, room_id) {
+                self.send_to_agent(agent_id, frame.clone());
+            }
         }
     }
 
     /// Send a frame to a specific agent by ID.
     pub fn send_to_agent(&self, agent_id: &str, frame: Frame) {
         if let Some(agent) = self.agents.get(agent_id) {
-            if agent.sender.send(frame).is_err() {
-                log::warn!("Failed to send to agent {}: channel closed", agent_id);
+            if let Err(error) = agent.sender.try_send(frame) {
+                log::warn!(
+                    "Disconnecting lagging agent {}: bounded queue unavailable: {}",
+                    agent_id,
+                    error
+                );
+                agent.disconnect.notify_one();
             }
         }
     }
@@ -253,7 +262,49 @@ impl Broker {
     }
 
     /// Get sender channel for a new agent connection.
-    pub fn create_agent_channel(&self) -> (mpsc::UnboundedSender<Frame>, mpsc::UnboundedReceiver<Frame>) {
-        mpsc::unbounded_channel()
+    pub fn create_agent_channel(&self) -> (mpsc::Sender<Frame>, mpsc::Receiver<Frame>) {
+        mpsc::channel(256)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clawchat_core::AgentInfo;
+    use tokio::sync::Notify;
+
+    #[tokio::test]
+    async fn saturated_outbound_queue_disconnects_lagging_agent() {
+        let agents = Arc::new(DashMap::new());
+        let broker = Broker::new(agents.clone(), Arc::new(DashMap::new()));
+        let (sender, _receiver) = mpsc::channel(1);
+        let disconnect = Arc::new(Notify::new());
+        agents.insert(
+            "slow".into(),
+            AgentConnection::new(
+                AgentInfo {
+                    agent_id: "slow".into(),
+                    name: "slow".into(),
+                    capabilities: vec![],
+                    connected_at: None,
+                    last_active: None,
+                    status: None,
+                    status_detail: None,
+                    progress: None,
+                },
+                "session".into(),
+                sender,
+                tokio::spawn(async {}),
+                tokio::spawn(async {}),
+                disconnect.clone(),
+                "key".into(),
+            ),
+        );
+        let event = Frame::event(FrameType::Ping, serde_json::json!({}));
+        broker.send_to_agent("slow", event.clone());
+        broker.send_to_agent("slow", event);
+        tokio::time::timeout(std::time::Duration::from_millis(100), disconnect.notified())
+            .await
+            .expect("queue saturation must signal disconnect");
     }
 }

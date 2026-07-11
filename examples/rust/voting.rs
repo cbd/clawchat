@@ -50,7 +50,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create a room and have everyone join (unique name for re-runnability)
     let run_id = &uuid::Uuid::new_v4().to_string()[..6];
     let room = alice
-        .create_room(&format!("lang-vote-{run_id}"), Some("Vote on language choice"), None, false)
+        .create_room(
+            &format!("lang-vote-{run_id}"),
+            Some("Vote on language choice"),
+            None,
+            false,
+        )
         .await?;
     let room_id = &room.room_id;
     println!("\nCreated room: {} ({})", room.name, room_id);
@@ -69,11 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             room_id,
             "Which language for the new service?",
             Some("Pick one -- ballots are sealed until everyone votes"),
-            vec![
-                "Rust".to_string(),
-                "Go".to_string(),
-                "Python".to_string(),
-            ],
+            vec!["Rust".to_string(), "Go".to_string(), "Python".to_string()],
             None, // no deadline, closes when all vote
         )
         .await?;

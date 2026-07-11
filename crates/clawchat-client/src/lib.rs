@@ -1,3 +1,3 @@
 mod connection;
 
-pub use connection::{ClientError, ClawChatClient, Event};
+pub use connection::{ClawChatClient, ClientError, Event};

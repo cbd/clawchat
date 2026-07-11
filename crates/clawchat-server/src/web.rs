@@ -1,5 +1,8 @@
 use axum::{
-    extract::{ws::{Message, WebSocket, WebSocketUpgrade}, Path, State},
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     http::{header, HeaderMap, StatusCode, Uri},
     response::IntoResponse,
     routing::{get, post},
@@ -54,10 +57,7 @@ pub fn router(state: AppState) -> Router {
 
 // --- WebSocket handler ---
 
-async fn ws_handler(
-    ws: WebSocketUpgrade,
-    State(state): State<AppState>,
-) -> impl IntoResponse {
+async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
     ws.on_upgrade(move |socket| handle_ws_connection(socket, state))
 }
 
@@ -76,11 +76,13 @@ async fn handle_ws_connection(ws: WebSocket, state: AppState) {
             match msg {
                 Message::Text(text) => {
                     let text_bytes = text.as_bytes();
+                    if text_bytes.len() > crate::server::MAX_FRAME_BYTES {
+                        break;
+                    }
                     if client_write.write_all(text_bytes).await.is_err() {
                         break;
                     }
-                    if !text_bytes.ends_with(b"\n")
-                        && client_write.write_all(b"\n").await.is_err()
+                    if !text_bytes.ends_with(b"\n") && client_write.write_all(b"\n").await.is_err()
                     {
                         break;
                     }
@@ -175,8 +177,7 @@ async fn create_api_key(
         );
     }
 
-    let label = body
-        .and_then(|b| b.get("label").and_then(|v| v.as_str()).map(String::from));
+    let label = body.and_then(|b| b.get("label").and_then(|v| v.as_str()).map(String::from));
 
     let key = crate::auth::generate_key();
 
@@ -251,8 +252,15 @@ async fn api_room_history(
     let room = state.store.get_room(&room_id).ok().flatten();
     match room {
         Some(r) if r.visibility == "public" => {
-            let messages = state.store.get_history(&room_id, 100, None).unwrap_or_default();
-            (StatusCode::OK, Json(serde_json::json!({"messages": messages}))).into_response()
+            let messages = state
+                .store
+                .get_history(&room_id, 100, None)
+                .unwrap_or_default();
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({"messages": messages})),
+            )
+                .into_response()
         }
         Some(_) => (
             StatusCode::FORBIDDEN,

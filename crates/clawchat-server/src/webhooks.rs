@@ -15,6 +15,7 @@ use base64::Engine as _;
 use clawchat_core::{ChatMessage, Subscription};
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -48,10 +49,7 @@ pub fn matches_filter(sub: &Subscription, msg: &ChatMessage) -> bool {
     if msg.seq <= sub.last_delivered_seq {
         return false;
     }
-    let meta_type = msg
-        .metadata
-        .get("type")
-        .and_then(|v| v.as_str());
+    let meta_type = msg.metadata.get("type").and_then(|v| v.as_str());
     // System messages aren't deliverable — they're protocol noise, not chat.
     if meta_type == Some("system") {
         return false;
@@ -61,10 +59,7 @@ pub fn matches_filter(sub: &Subscription, msg: &ChatMessage) -> bool {
     }
     if !sub.kinds.is_empty() {
         let kind = msg.metadata.get("kind").and_then(|v| v.as_str());
-        let any_match = sub
-            .kinds
-            .iter()
-            .any(|want| Some(want.as_str()) == kind);
+        let any_match = sub.kinds.iter().any(|want| Some(want.as_str()) == kind);
         if !any_match {
             return false;
         }
@@ -91,26 +86,101 @@ pub struct WebhookManager {
 struct Inner {
     store: Arc<Store>,
     notify: Notify,
-    http: reqwest::Client,
+    allow_private: bool,
+}
+
+fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => {
+            let octets = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_multicast()
+                || ip.is_broadcast()
+                || ip.is_unspecified()
+                || octets[0] == 0
+                || (octets[0] == 100 && (64..=127).contains(&octets[1]))
+                || (octets[0] == 198 && (octets[1] == 18 || octets[1] == 19))
+                || ip == Ipv4Addr::new(169, 254, 169, 254))
+        }
+        IpAddr::V6(ip) => {
+            let segments = ip.segments();
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xffc0) == 0xfe80
+                || ip
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| !is_public_ip(IpAddr::V4(mapped))))
+        }
+    }
+}
+
+async fn resolve_public_webhook(
+    raw: &str,
+    allow_private: bool,
+) -> Result<(reqwest::Url, String, SocketAddr), String> {
+    let url = reqwest::Url::parse(raw).map_err(|error| format!("invalid webhook_url: {error}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err("webhook_url must be http(s)".into());
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("webhook_url credentials are not allowed".into());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "webhook_url requires a host".to_string())?
+        .to_string();
+    if !allow_private && (host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")) {
+        return Err("webhook_url may not target localhost".into());
+    }
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "webhook_url requires a known port".to_string())?;
+    let addresses = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|error| format!("webhook host resolution failed: {error}"))?
+        .collect::<Vec<_>>();
+    if addresses.is_empty()
+        || (!allow_private && addresses.iter().any(|addr| !is_public_ip(addr.ip())))
+    {
+        return Err("webhook_url resolves to a private, local, or reserved address".into());
+    }
+    Ok((url, host, addresses[0]))
+}
+
+async fn pinned_http_client(
+    raw: &str,
+    allow_private: bool,
+) -> Result<(reqwest::Client, reqwest::Url), String> {
+    let (url, host, address) = resolve_public_webhook(raw, allow_private).await?;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("clawchat-webhook/", env!("CARGO_PKG_VERSION")))
+        .resolve(&host, address)
+        .build()
+        .map_err(|error| format!("webhook client setup failed: {error}"))?;
+    Ok((client, url))
 }
 
 impl WebhookManager {
-    pub fn new(store: Arc<Store>) -> Self {
-        let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(10))
-            .user_agent(concat!(
-                "clawchat-webhook/",
-                env!("CARGO_PKG_VERSION")
-            ))
-            .build()
-            .expect("reqwest client builds with default settings");
+    pub fn new(store: Arc<Store>, allow_private: bool) -> Self {
         Self {
             inner: Arc::new(Inner {
                 store,
                 notify: Notify::new(),
-                http,
+                allow_private,
             }),
         }
+    }
+
+    pub async fn validate_url(&self, raw: &str) -> Result<(), String> {
+        resolve_public_webhook(raw, self.inner.allow_private)
+            .await
+            .map(|_| ())
     }
 
     /// Enqueue deliveries for `msg` to every matching active subscription on
@@ -265,9 +335,24 @@ async fn process_delivery(inner: Arc<Inner>, d: crate::store::PendingDelivery) {
     let body = serde_json::to_string(&envelope).unwrap_or_default();
     let signature = sign_request(&secret, &webhook_id, timestamp, &body);
 
-    let req = inner
-        .http
-        .post(&sub.webhook_url)
+    let (http, pinned_url) = match pinned_http_client(&sub.webhook_url, inner.allow_private).await {
+        Ok(value) => value,
+        Err(error) => {
+            log::warn!(
+                "webhook delivery blocked sub={}: {}",
+                sub.subscription_id,
+                error
+            );
+            let _ = inner.store.set_subscription_status(
+                &sub.subscription_id,
+                "failed",
+                Some(d.attempts + 1),
+            );
+            return;
+        }
+    };
+    let req = http
+        .post(pinned_url)
         .header("content-type", "application/json")
         .header("webhook-id", &webhook_id)
         .header("webhook-timestamp", timestamp.to_string())
@@ -318,12 +403,9 @@ async fn process_delivery(inner: Arc<Inner>, d: crate::store::PendingDelivery) {
             } else {
                 let delay = Duration::from_secs(RETRY_SCHEDULE_SECS[idx]);
                 let next = chrono::Utc::now() + chrono::Duration::from_std(delay).unwrap();
-                let _ = inner.store.reschedule_delivery(
-                    &d.delivery_id,
-                    next,
-                    new_attempts,
-                    &err,
-                );
+                let _ = inner
+                    .store
+                    .reschedule_delivery(&d.delivery_id, next, new_attempts, &err);
                 log::debug!(
                     "webhook delivery retry sub={} seq={} attempt={} in={:?} err={}",
                     sub.subscription_id,
@@ -350,6 +432,24 @@ mod tests {
         // Different inputs → different sig.
         let s3 = sign_request("topsecret", "wh_124", 1700000000, r#"{"a":1}"#);
         assert_ne!(s1, s3);
+    }
+
+    #[tokio::test]
+    async fn webhook_url_rejects_local_and_metadata_targets() {
+        assert!(resolve_public_webhook("http://127.0.0.1/hook", false)
+            .await
+            .is_err());
+        assert!(resolve_public_webhook("http://[::1]/hook", false)
+            .await
+            .is_err());
+        assert!(
+            resolve_public_webhook("http://169.254.169.254/latest", false)
+                .await
+                .is_err()
+        );
+        assert!(resolve_public_webhook("ftp://example.com/hook", false)
+            .await
+            .is_err());
     }
 
     #[test]

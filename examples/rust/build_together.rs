@@ -73,12 +73,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let run_id = &uuid::Uuid::new_v4().to_string()[..6];
     let room_name = format!("tictactoe-{run_id}");
     let project = coordinator
-        .create_room(
-            &room_name,
-            Some("Tic-tac-toe game project"),
-            None,
-            false,
-        )
+        .create_room(&room_name, Some("Tic-tac-toe game project"), None, false)
         .await?;
     let project_id = project.room_id.clone();
     println!("\n  Created project room: {room_name} ({project_id})");
@@ -102,10 +97,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create ephemeral sub-rooms for focused work
     let server_room = coordinator
-        .create_room(&format!("ttt-server-{run_id}"), None, Some(&project_id), true)
+        .create_room(
+            &format!("ttt-server-{run_id}"),
+            None,
+            Some(&project_id),
+            true,
+        )
         .await?;
     let client_room = coordinator
-        .create_room(&format!("ttt-client-{run_id}"), None, Some(&project_id), true)
+        .create_room(
+            &format!("ttt-client-{run_id}"),
+            None,
+            Some(&project_id),
+            true,
+        )
         .await?;
     println!(
         "  Created sub-rooms: ttt-server-{run_id} ({}), ttt-client-{run_id} ({})",
@@ -175,7 +180,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Post the result to the room
     coordinator
-        .send_message(&project_id, "Vote result: JSON wins! We'll use JSON.", None, vec![])
+        .send_message(
+            &project_id,
+            "Vote result: JSON wins! We'll use JSON.",
+            None,
+            vec![],
+        )
         .await?;
 
     // ========================================================

@@ -72,8 +72,8 @@ pub fn derive_room_key(secret: &[u8], room_id: &str) -> [u8; 32] {
 /// Encrypt `plaintext` for `room_id`, returning a self-describing `clw1:` blob.
 pub fn encrypt(secret: &[u8], room_id: &str, plaintext: &str) -> String {
     let key = derive_room_key(secret, room_id);
-    let cipher = ChaCha20Poly1305::new_from_slice(&key)
-        .expect("32-byte key is valid for ChaCha20-Poly1305");
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key is valid for ChaCha20-Poly1305");
     let nonce = ChaCha20Poly1305::generate_nonce(&mut OsRng);
     let ct = cipher
         .encrypt(&nonce, plaintext.as_bytes())
@@ -88,15 +88,17 @@ pub fn encrypt(secret: &[u8], room_id: &str, plaintext: &str) -> String {
 /// `secret`. Returns [`CryptoError::NotCiphertext`] if `blob` isn't a ClawChat
 /// blob, and [`CryptoError::DecryptFailed`] on a wrong key or tampered input.
 pub fn decrypt(secret: &[u8], room_id: &str, blob: &str) -> Result<String, CryptoError> {
-    let b64 = blob.strip_prefix(PREFIX).ok_or(CryptoError::NotCiphertext)?;
+    let b64 = blob
+        .strip_prefix(PREFIX)
+        .ok_or(CryptoError::NotCiphertext)?;
     let raw = B64.decode(b64).map_err(|_| CryptoError::Malformed)?;
     if raw.len() < NONCE_LEN {
         return Err(CryptoError::Malformed);
     }
     let (nonce_bytes, ct) = raw.split_at(NONCE_LEN);
     let key = derive_room_key(secret, room_id);
-    let cipher = ChaCha20Poly1305::new_from_slice(&key)
-        .expect("32-byte key is valid for ChaCha20-Poly1305");
+    let cipher =
+        ChaCha20Poly1305::new_from_slice(&key).expect("32-byte key is valid for ChaCha20-Poly1305");
     let pt = cipher
         .decrypt(Nonce::from_slice(nonce_bytes), ct)
         .map_err(|_| CryptoError::DecryptFailed)?;

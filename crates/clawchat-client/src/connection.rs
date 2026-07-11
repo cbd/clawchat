@@ -2,9 +2,93 @@ use clawchat_core::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+
+const MAX_FRAME_BYTES: usize = 1024 * 1024;
+
+async fn read_frame_line<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<String>> {
+    let mut bytes = Vec::with_capacity(4096);
+    let read = reader
+        .take((MAX_FRAME_BYTES + 1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .await?;
+    if read == 0 {
+        return Ok(None);
+    }
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "NDJSON frame exceeds 1 MiB limit",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn client_answers_server_heartbeat_ping() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read_half, mut write_half) = tokio::io::split(stream);
+            let mut reader = BufReader::new(read_half);
+            let register = read_frame_line(&mut reader).await.unwrap().unwrap();
+            let register = Frame::from_line(&register).unwrap();
+            let ok = Frame::ok(
+                register.id.as_deref(),
+                serde_json::json!({"agent_id": "heartbeat-client"}),
+            );
+            write_half
+                .write_all(ok.to_line().unwrap().as_bytes())
+                .await
+                .unwrap();
+
+            let ping = Frame {
+                id: Some("heartbeat-1".into()),
+                reply_to: None,
+                frame_type: FrameType::Ping,
+                payload: serde_json::json!({"heartbeat": true}),
+            };
+            write_half
+                .write_all(ping.to_line().unwrap().as_bytes())
+                .await
+                .unwrap();
+            let pong = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                read_frame_line(&mut reader),
+            )
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+            let pong = Frame::from_line(&pong).unwrap();
+            assert_eq!(pong.frame_type, FrameType::Pong);
+            assert_eq!(pong.reply_to.as_deref(), Some("heartbeat-1"));
+        });
+
+        let _client = ClawChatClient::connect_tcp(
+            &addr.to_string(),
+            "test-key",
+            "client",
+            Some("heartbeat-client"),
+            vec![],
+        )
+        .await
+        .unwrap();
+        server.await.unwrap();
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -32,7 +116,7 @@ pub struct Event {
 
 pub struct ClawChatClient {
     /// Channel to send frames to the writer task.
-    write_tx: mpsc::UnboundedSender<Frame>,
+    write_tx: mpsc::Sender<Frame>,
     /// Pending request completions: correlation_id -> oneshot sender.
     pending: Arc<Mutex<HashMap<String, oneshot::Sender<Frame>>>>,
     /// Broadcast channel for server-pushed events.
@@ -40,6 +124,7 @@ pub struct ClawChatClient {
     /// Agent info after registration.
     pub agent_id: String,
     pub agent_name: String,
+    stable_identity: bool,
     /// Pre-shared secret for end-to-end encrypted rooms. When set, message
     /// `content` is encrypted before send and decrypted after receive, keyed
     /// per-room. None means the client sends/receives plaintext.
@@ -85,7 +170,7 @@ impl ClawChatClient {
         R: tokio::io::AsyncRead + Unpin + Send + 'static,
         W: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Frame>();
+        let (write_tx, mut write_rx) = mpsc::channel::<Frame>(256);
         let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Frame>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, _) = broadcast::channel::<Event>(256);
@@ -116,15 +201,22 @@ impl ClawChatClient {
         // Reader task
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
+        // A weak sender lets dropping the client close the writer even while
+        // the reader task is still blocked on the socket.
+        let pong_tx = write_tx.downgrade();
         tokio::spawn(async move {
             let mut reader = BufReader::new(read_half);
-            let mut line = String::new();
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
+                match read_frame_line(&mut reader).await {
+                    Ok(None) => break, // EOF
+                    Ok(Some(line)) => {
                         if let Ok(frame) = Frame::from_line(&line) {
+                            if frame.frame_type == FrameType::Ping {
+                                if let Some(tx) = pong_tx.upgrade() {
+                                    let _ = tx.send(Frame::pong(frame.id.as_deref())).await;
+                                }
+                                continue;
+                            }
                             // Check if this is a response to a pending request
                             if let Some(reply_to) = &frame.reply_to {
                                 let mut pending = pending_clone.lock().await;
@@ -142,7 +234,16 @@ impl ClawChatClient {
             }
         });
 
-        Self::finish_register(write_tx, pending, event_tx, key, name, agent_id, capabilities).await
+        Self::finish_register(
+            write_tx,
+            pending,
+            event_tx,
+            key,
+            name,
+            agent_id,
+            capabilities,
+        )
+        .await
     }
 
     /// Connect via WebSocket (ws:// or wss://) and register. The URL should
@@ -167,7 +268,7 @@ impl ClawChatClient {
             .map_err(|e| ClientError::Ws(e.to_string()))?;
         let (mut sink, mut stream) = ws.split();
 
-        let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Frame>();
+        let (write_tx, mut write_rx) = mpsc::channel::<Frame>(256);
         let pending: Arc<Mutex<HashMap<String, oneshot::Sender<Frame>>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let (event_tx, _) = broadcast::channel::<Event>(256);
@@ -190,6 +291,7 @@ impl ClawChatClient {
         // Reader task: each WS text message is one frame.
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
+        let pong_tx = write_tx.downgrade();
         tokio::spawn(async move {
             while let Some(msg) = stream.next().await {
                 let text = match msg {
@@ -198,7 +300,16 @@ impl ClawChatClient {
                     Ok(Message::Close(_)) | Err(_) => break,
                     Ok(_) => continue, // ping/pong/frame — ignore
                 };
+                if text.len() > MAX_FRAME_BYTES {
+                    break;
+                }
                 if let Ok(frame) = Frame::from_line(&text) {
+                    if frame.frame_type == FrameType::Ping {
+                        if let Some(tx) = pong_tx.upgrade() {
+                            let _ = tx.send(Frame::pong(frame.id.as_deref())).await;
+                        }
+                        continue;
+                    }
                     if let Some(reply_to) = &frame.reply_to {
                         let mut pending = pending_clone.lock().await;
                         if let Some(sender) = pending.remove(reply_to) {
@@ -211,14 +322,23 @@ impl ClawChatClient {
             }
         });
 
-        Self::finish_register(write_tx, pending, event_tx, key, name, agent_id, capabilities).await
+        Self::finish_register(
+            write_tx,
+            pending,
+            event_tx,
+            key,
+            name,
+            agent_id,
+            capabilities,
+        )
+        .await
     }
 
     /// Shared post-transport setup: perform the register handshake over the
     /// already-wired channels and construct the client. Used by every transport
     /// (UDS, TCP, WebSocket).
     async fn finish_register(
-        write_tx: mpsc::UnboundedSender<Frame>,
+        write_tx: mpsc::Sender<Frame>,
         pending: Arc<Mutex<HashMap<String, oneshot::Sender<Frame>>>>,
         event_tx: broadcast::Sender<Event>,
         key: &str,
@@ -226,6 +346,7 @@ impl ClawChatClient {
         agent_id: Option<&str>,
         capabilities: Vec<String>,
     ) -> Result<Self, ClientError> {
+        let stable_identity = agent_id.is_some();
         let register_frame = Frame {
             id: Some(uuid::Uuid::new_v4().to_string()),
             reply_to: None,
@@ -253,6 +374,7 @@ impl ClawChatClient {
         }
         write_tx
             .send(register_frame)
+            .await
             .map_err(|_| ClientError::Channel)?;
 
         let response = tokio::time::timeout(std::time::Duration::from_secs(5), resp_rx)
@@ -282,6 +404,7 @@ impl ClawChatClient {
             event_tx,
             agent_id,
             agent_name: name.to_string(),
+            stable_identity,
             room_secret: None,
         })
     }
@@ -318,6 +441,14 @@ impl ClawChatClient {
         }
     }
 
+    /// Whether a message was posted by this logical client. With a stable
+    /// agent_id, identity is ID-only so two distinct agents may safely share a
+    /// display name. Name fallback is retained only for legacy one-shot calls.
+    pub fn is_self_message(&self, msg: &ChatMessage) -> bool {
+        msg.agent_id == self.agent_id
+            || (!self.stable_identity && msg.agent_name == self.agent_name)
+    }
+
     /// Send a request and wait for the response.
     async fn request(
         &self,
@@ -335,17 +466,38 @@ impl ClawChatClient {
         let (resp_tx, resp_rx) = oneshot::channel();
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(id, resp_tx);
+            pending.insert(id.clone(), resp_tx);
         }
 
-        self.write_tx
-            .send(frame)
-            .map_err(|_| ClientError::Channel)?;
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.write_tx.send(frame),
+        )
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                self.pending.lock().await.remove(&id);
+                return Err(ClientError::Channel);
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(ClientError::Timeout);
+            }
+        }
 
-        let response = tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx)
-            .await
-            .map_err(|_| ClientError::Timeout)?
-            .map_err(|_| ClientError::ConnectionClosed)?;
+        let response = match tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx).await
+        {
+            Ok(Ok(response)) => response,
+            Ok(Err(_)) => {
+                self.pending.lock().await.remove(&id);
+                return Err(ClientError::ConnectionClosed);
+            }
+            Err(_) => {
+                self.pending.lock().await.remove(&id);
+                return Err(ClientError::Timeout);
+            }
+        };
 
         if response.frame_type == FrameType::Error {
             let err: ErrorPayload = serde_json::from_value(response.payload)
@@ -408,11 +560,8 @@ impl ClawChatClient {
     }
 
     pub async fn join_room(&self, room_id: &str) -> Result<(), ClientError> {
-        self.request(
-            FrameType::JoinRoom,
-            serde_json::json!({"room_id": room_id}),
-        )
-        .await?;
+        self.request(FrameType::JoinRoom, serde_json::json!({"room_id": room_id}))
+            .await?;
         Ok(())
     }
 
@@ -432,14 +581,8 @@ impl ClawChatClient {
         reply_to: Option<&str>,
         mentions: Vec<String>,
     ) -> Result<ChatMessage, ClientError> {
-        self.send_message_with_metadata(
-            room_id,
-            content,
-            reply_to,
-            mentions,
-            serde_json::json!({}),
-        )
-        .await
+        self.send_message_with_metadata(room_id, content, reply_to, mentions, serde_json::json!({}))
+            .await
     }
 
     /// Like `send_message` but lets you attach arbitrary metadata. Used by
@@ -475,11 +618,7 @@ impl ClawChatClient {
     /// (with `metadata.type = "thinking"`) so late-joining clients can see prior
     /// reasoning, but does NOT advance the room's turn token and is broadcast as
     /// a `thinking` event rather than `message_received`.
-    pub async fn thinking(
-        &self,
-        room_id: &str,
-        content: &str,
-    ) -> Result<ChatMessage, ClientError> {
+    pub async fn thinking(&self, room_id: &str, content: &str) -> Result<ChatMessage, ClientError> {
         let resp = self
             .request(
                 FrameType::Thinking,
@@ -555,12 +694,13 @@ impl ClawChatClient {
     /// Return the latest seq for a room, or 0 if the room has no messages.
     pub async fn room_tip(&self, room_id: &str) -> Result<i64, ClientError> {
         let resp = self
-            .request(
-                FrameType::RoomTip,
-                serde_json::json!({"room_id": room_id}),
-            )
+            .request(FrameType::RoomTip, serde_json::json!({"room_id": room_id}))
             .await?;
-        Ok(resp.payload.get("seq").and_then(|v| v.as_i64()).unwrap_or(0))
+        Ok(resp
+            .payload
+            .get("seq")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0))
     }
 
     pub async fn list_rooms(&self, parent_id: Option<&str>) -> Result<Vec<Room>, ClientError> {
@@ -604,10 +744,7 @@ impl ClawChatClient {
 
     /// Convenience: return the agent_id currently holding the turn token in `room_id`,
     /// or None if the room is empty.
-    pub async fn current_turn_holder(
-        &self,
-        room_id: &str,
-    ) -> Result<Option<String>, ClientError> {
+    pub async fn current_turn_holder(&self, room_id: &str) -> Result<Option<String>, ClientError> {
         let info = self.room_info(room_id).await?;
         Ok(info
             .get("current_turn_holder")
@@ -767,7 +904,7 @@ impl ClawChatClient {
         Ok(())
     }
 
-    /// Set this agent's presence status. Status must be "idle", "waiting", or "working".
+    /// Set this agent's presence status. Status must be "idle", "waiting", "working", or "thinking".
     pub async fn set_presence(
         &self,
         status: &str,
@@ -830,8 +967,7 @@ impl ClawChatClient {
                 // fresh random agent_id, so two invocations under the same --name
                 // (e.g. one `send` + one `wait`) have different ids; the name
                 // backstop catches that case.
-                let is_self =
-                    m.agent_id == self.agent_id || m.agent_name == self.agent_name;
+                let is_self = self.is_self_message(m);
                 !is_thinking && !is_system && !is_self
             }) {
                 return Ok(Some(msg));
@@ -861,7 +997,7 @@ impl ClawChatClient {
                                         let meta_type =
                                             msg.metadata.get("type").and_then(|v| v.as_str());
                                         let is_system = meta_type == Some("system");
-                                        let is_self = msg.agent_name == self.agent_name;
+                                        let is_self = self.is_self_message(&msg);
                                         if is_system || is_self {
                                             continue;
                                         }
@@ -915,7 +1051,7 @@ impl ClawChatClient {
                 .unwrap(),
             )
             .await?;
-        Ok(serde_json::from_value(resp.payload).map_err(ClientError::Json)?)
+        serde_json::from_value(resp.payload).map_err(ClientError::Json)
     }
 
     pub async fn unsubscribe(&self, subscription_id: &str) -> Result<(), ClientError> {
@@ -948,13 +1084,10 @@ impl ClawChatClient {
             .get("subscriptions")
             .cloned()
             .unwrap_or(serde_json::Value::Array(vec![]));
-        Ok(serde_json::from_value(subs).map_err(ClientError::Json)?)
+        serde_json::from_value(subs).map_err(ClientError::Json)
     }
 
-    pub async fn enable_subscription(
-        &self,
-        subscription_id: &str,
-    ) -> Result<(), ClientError> {
+    pub async fn enable_subscription(&self, subscription_id: &str) -> Result<(), ClientError> {
         self.request(
             FrameType::EnableSubscription,
             serde_json::to_value(EnableSubscriptionPayload {

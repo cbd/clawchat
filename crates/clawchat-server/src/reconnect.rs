@@ -25,6 +25,11 @@ pub struct ReconnectManager {
     stashed: Arc<DashMap<String, StashedAgent>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReclaimError {
+    CredentialMismatch,
+}
+
 impl ReconnectManager {
     pub fn new() -> Self {
         let mgr = Self {
@@ -46,13 +51,7 @@ impl ReconnectManager {
     }
 
     /// Stash an agent's state on disconnect. Returns immediately.
-    pub fn stash(
-        &self,
-        agent_id: String,
-        name: String,
-        api_key: String,
-        rooms: HashSet<String>,
-    ) {
+    pub fn stash(&self, agent_id: String, name: String, api_key: String, rooms: HashSet<String>) {
         log::info!(
             "Stashing reconnect state for {} ({}) — {} rooms",
             name,
@@ -72,9 +71,19 @@ impl ReconnectManager {
         );
     }
 
-    /// Try to reclaim a stashed agent. Returns the stashed state if found and
-    /// the reconnect window hasn't expired.
-    pub fn reclaim(&self, agent_id: &str) -> Option<StashedAgent> {
+    /// Try to reclaim a stashed agent. A stable identity is owned by the API
+    /// key that created it; another credential must not be able to reclaim it.
+    pub fn reclaim(
+        &self,
+        agent_id: &str,
+        api_key: &str,
+        no_auth: bool,
+    ) -> Result<Option<StashedAgent>, ReclaimError> {
+        if let Some(stashed) = self.stashed.get(agent_id) {
+            if !no_auth && stashed.api_key != api_key {
+                return Err(ReclaimError::CredentialMismatch);
+            }
+        }
         if let Some((_, stashed)) = self.stashed.remove(agent_id) {
             if stashed.disconnected_at.elapsed() < Duration::from_secs(RECONNECT_WINDOW_SECS) {
                 log::info!(
@@ -83,11 +92,11 @@ impl ReconnectManager {
                     agent_id,
                     stashed.disconnected_at.elapsed().as_secs_f64()
                 );
-                return Some(stashed);
+                return Ok(Some(stashed));
             }
             log::debug!("Stashed state for {} expired", agent_id);
         }
-        None
+        Ok(None)
     }
 
     /// Buffer a message for a disconnected agent (e.g. room messages they're missing).
@@ -111,5 +120,29 @@ impl ReconnectManager {
             .filter(|entry| entry.value().rooms.contains(room_id))
             .map(|entry| entry.key().clone())
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn expired_stash_does_not_define_identity_ownership() {
+        let manager = ReconnectManager::new();
+        manager.stash(
+            "stable".into(),
+            "Stable".into(),
+            "owner-key".into(),
+            HashSet::new(),
+        );
+        manager.stashed.get_mut("stable").unwrap().disconnected_at =
+            Instant::now() - Duration::from_secs(RECONNECT_WINDOW_SECS + 1);
+        assert!(manager
+            .reclaim("stable", "owner-key", false)
+            .unwrap()
+            .is_none());
+        // Permanent ownership is intentionally tested in Store/server restart
+        // tests; this manager only owns the short-lived room/message stash.
     }
 }

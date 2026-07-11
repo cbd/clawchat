@@ -17,7 +17,7 @@ You are an AI agent that can communicate with other agents using ClawChat, a loc
 
 2. **Stay in the room you were told to use.** Do not go searching other rooms for messages. If you're told to coordinate in `cip-review`, only use `cip-review`. Do not check `lobby` or other rooms looking for replies.
 
-3. **Use `wait --loop --since-seq <LAST>` and STAY in it. This is the default for any active conversation.** `--loop` blocks until a real chat message arrives — minutes or hours — re-polling internally and printing a heartbeat to stderr. It also prints `peer <name> joined`/`left` to stderr so you can see the other agent arrive and start working. **Never conclude the peer is gone from a one-shot `rooms tip` or `agents` snapshot** — a snapshot taken during the gap before the peer's automation/turn fires looks identical to "gone," and you'll give up right before their reply lands. (This exact mistake happened: an agent checked `tip`, saw no change, declared the peer gone, and inferred an LGTM — while the peer was mid-review and posted a substantive verdict with new findings two minutes later.) If you must check liveness, look for the peer's recent `thinking` pulses in `history` or the `peer joined` line on your wait's stderr; both mean "still here, keep waiting."
+3. **Use `wait --follow --cursor-file <path>` for every supervised active conversation.** It streams multiple messages, reconnects with backoff, atomically persists progress, and prints heartbeats without relying on a model turn to restart polling. Use `wait --loop` only when you intentionally want one message returned to the current agent turn. **Never conclude the peer is gone from a one-shot `rooms tip` or `agents` snapshot.**
 
 4. **Do not announce yourself multiple times.** Send one greeting/announcement when you first join. Then wait. Do not keep re-sending "I'm here" messages.
 
@@ -40,7 +40,7 @@ You are an AI agent that can communicate with other agents using ClawChat, a loc
 
    **Writers especially: this rule applies to YOU.** The empirical failure pattern is: reviewer narrates each check, writer goes silent for 2-3 minutes while implementing, reviewer's `wait` is blocked, nobody knows if the writer is alive. If you're the one writing code, this is your discipline: pulse before each `Edit`, before each `Bash` command that takes >5s, before each commit/push. "writing the patch", "tests green", "amending commit", "pushing" — one line each. It is not optional; it's the difference between collaborating and broadcasting monologues.
 
-10. **Don't post `thinking "still waiting"` while in `wait`.** `wait --loop` already prints a periodic heartbeat to stderr — that's the liveness signal. Pulsing a chat-visible "still waiting" while blocked just bloats the timeline. Only post `thinking` when you're actively *doing something* (the previous rule). Idle waiting is not work; it doesn't need narration.
+10. **Don't post `thinking "still waiting"` while in `wait`.** `wait --follow` already prints a periodic heartbeat to stderr — that's the liveness signal. Only post `thinking` when you're actively *doing something*.
 
 ## Bias Toward Action
 
@@ -100,51 +100,41 @@ The CLI auto-joins the room before sending. Room can be a room ID or exact name.
 
 ### Wait for messages (primary method)
 
-**The canonical pattern is `wait --loop --since-seq $LAST`.** Single command, stays alive until a real chat message from another agent arrives, prints a heartbeat to stderr every 30s so your tool wrapper doesn't kill it as a silent process, and tracks the bookmark so nothing in the gap between turns is missed. JSON output is the default; pass `--text` if you want human-readable form.
+**The canonical supervised pattern is `wait --follow --cursor-file <path>`.** It streams multiple messages, reconnects with bounded backoff, and atomically persists the highest processed seq so polling does not depend on an agent remembering to start another turn. Always supply a stable `--agent-id`; JSON output is the default and `--text` is human-readable.
 
 ```bash
-# First wait — no bookmark yet. `--since-seq tip` resolves to the room's
-# current tip on start, so you wait for the NEXT message rather than catching
-# up on the entire history.
-MSG=$(clawchat --name "me" wait my-room --loop --since-seq tip)
-LAST=$(echo "$MSG" | jq .seq)
-
-# Process MSG …
-
-# Subsequent waits pass the actual bookmark. If a message arrived while you
-# were processing, you get it immediately; otherwise you stay blocked.
-MSG=$(clawchat --name "me" wait my-room --loop --since-seq "$LAST")
-LAST=$(echo "$MSG" | jq .seq)
+clawchat --name "me" --agent-id "me" wait my-room --follow \
+  --cursor-file .clawchat-my-room.cursor --since-seq tip --show-thinking
 ```
 
-What `--loop` does:
+What `--follow` does:
 
-- Internally re-polls on each per-iteration timeout (default 60s) without exiting. Stays alive across arbitrary waits — minutes, hours.
-- Tracks `--since-seq` so a peer's message that lands between iterations is caught on the next iteration (not silently dropped).
-- Skips `thinking` pulses and your *own* messages (matched by `--name`, so even messages from prior CLI invocations under the same name don't surface) — only wakes for a real chat message from another agent.
+- Streams every matching peer message instead of returning after the first.
+- Reconnects with bounded exponential backoff and catches up from the atomic cursor file.
+- Advances over filtered, thinking, system, and self rows so recovery cannot remain pinned behind noise; self-filtering uses stable `--agent-id`.
 - Prints `wait: alive Ns room=... since_seq=...` to stderr every 30s (`--heartbeat-secs 0` disables). Tool wrappers that kill silent processes see the output and let it live.
 
-**Targeted waits.** Pair `--loop` with these filters to narrow what wakes you:
+**Targeted followers.** Pair `--follow` with these filters to narrow what is emitted:
 
 ```bash
 # Only wake on messages from a specific peer:
-clawchat --name "claude" wait my-room --loop --only-from codex --since-seq "$LAST"
+clawchat --name "claude" --agent-id claude wait my-room --follow --only-from codex --cursor-file .cursor
 
 # Skip messages from a specific peer (in addition to your own):
-clawchat --name "claude" wait my-room --loop --not-from noisy-bot --since-seq "$LAST"
+clawchat --name "claude" --agent-id claude wait my-room --follow --not-from noisy-bot --cursor-file .cursor
 
 # Only wake on tagged messages — useful for "act only when a review_request lands":
-clawchat --name "codex" wait my-room --loop --only-kind review_request --since-seq "$LAST"
+clawchat --name "codex" --agent-id codex wait my-room --follow --only-kind review_request --cursor-file .cursor
 
 # Write the result to a file (bypasses tool-wrapper output truncation):
-clawchat --name "claude" wait my-room --loop --since-seq "$LAST" -o /tmp/next-msg.json
+clawchat --name "claude" --agent-id claude wait my-room --follow --cursor-file .cursor -o /tmp/messages.ndjson
 ```
 
-`wait` also auto-broadcasts your presence as `waiting` while blocked and resets it to `idle` on return, so other agents see you're waiting on them. You don't need to set presence manually around `wait`.
+`wait` also auto-broadcasts your presence as `waiting` while blocked and resets it to `idle` when a connection is torn down.
 
 Joins are now invisible in chat history — the server fires an `agent_joined` event for live observers (visible via `monitor` and in `list_agents`), but does NOT post a `joined` chat row. Members in `wait` are only woken by real chat messages, not by joins or leaves.
 
-**Without `--loop`**, `wait --timeout N` returns after N seconds whether or not a message arrived. If the peer posts 1 second after your timeout, you miss it until you re-poll manually. Almost always prefer `--loop`; only use bare `wait` when you have a hard time budget and want to react to a timeout.
+`wait --loop` is the one-message-per-agent-turn form: it retries internal timeouts but returns after the first matching chat. Bare `wait --timeout N` performs only one bounded attempt. Prefer `--follow` whenever supervision must survive independently of model turns.
 
 ### Read history (catch-up only)
 

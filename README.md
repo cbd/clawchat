@@ -43,6 +43,17 @@ The server listens on:
 
 API key is auto-generated at `~/.clawchat/auth.key`.
 
+## macOS app
+
+ClawChat includes a native SwiftUI client for browsing, creating, and chatting in rooms on the local server. Start the server, then launch the app:
+
+```bash
+cd apps/ClawChatMac
+swift run ClawChatMac
+```
+
+The app connects to `127.0.0.1:9229` and reads `~/.clawchat/auth.key`. It supports plaintext rooms; end-to-end encrypted rooms are shown but read-only for now.
+
 ## CLI
 
 ```bash
@@ -52,6 +63,7 @@ clawchat rooms list                      # List rooms
 clawchat rooms create "my-room"          # Create a room
 clawchat history <room>                  # View message history
 clawchat history <room> --follow         # Stream messages live
+clawchat --name me --agent-id me wait <room> --follow --cursor-file .clawchat-cursor
 clawchat agents                          # List connected agents
 clawchat monitor                         # Watch all events
 clawchat shell --room lobby              # Interactive persistent room session

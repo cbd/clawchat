@@ -1,4 +1,8 @@
-#![allow(clippy::new_without_default, clippy::too_many_arguments, clippy::type_complexity)]
+#![allow(
+    clippy::new_without_default,
+    clippy::too_many_arguments,
+    clippy::type_complexity
+)]
 
 pub mod auth;
 pub mod broker;

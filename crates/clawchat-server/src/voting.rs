@@ -44,12 +44,54 @@ pub struct VoteManager {
 }
 
 impl VoteManager {
-    pub fn new() -> Self {
-        Self {
+    pub fn new(store: Arc<Store>, broker: Arc<Broker>) -> Self {
+        let manager = Self {
             active_votes: Arc::new(DashMap::new()),
             active_elections: Arc::new(DashMap::new()),
             room_leaders: Arc::new(DashMap::new()),
+        };
+        if let Ok(votes) = store.list_open_votes() {
+            for meta in votes {
+                let ballots = store.get_vote_ballots(&meta.vote_id).unwrap_or_default();
+                let vote = ActiveVote {
+                    vote_id: meta.vote_id.clone(),
+                    room_id: meta.room_id,
+                    title: meta.title,
+                    description: meta.description,
+                    options: meta.options,
+                    created_by: meta.created_by,
+                    created_at: meta.created_at,
+                    closes_at: meta.closes_at,
+                    ballots,
+                    eligible_voters: meta.eligible_voters,
+                    is_ephemeral: false,
+                };
+                manager.active_votes.insert(meta.vote_id.clone(), vote);
+                if let Some(closes_at) = meta.closes_at {
+                    let delay = (closes_at - chrono::Utc::now())
+                        .to_std()
+                        .unwrap_or(Duration::ZERO);
+                    manager.schedule_deadline(meta.vote_id, delay, broker.clone(), store.clone());
+                }
+            }
         }
+        manager
+    }
+
+    fn schedule_deadline(
+        &self,
+        vote_id: String,
+        delay: Duration,
+        broker: Arc<Broker>,
+        store: Arc<Store>,
+    ) {
+        let active_votes = self.active_votes.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some((_, vote)) = active_votes.remove(&vote_id) {
+                close_and_broadcast_vote(vote, &broker, &store).await;
+            }
+        });
     }
 
     /// Create a vote and optionally spawn a deadline timer.
@@ -88,15 +130,7 @@ impl VoteManager {
 
         // Spawn deadline timer if duration is set
         if let Some(secs) = duration_secs {
-            let active_votes = self.active_votes.clone();
-            let vote_id_clone = vote_id.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_secs(secs)).await;
-                // Close the vote if still active
-                if let Some((_, vote)) = active_votes.remove(&vote_id_clone) {
-                    close_and_broadcast_vote(vote, &broker, &store).await;
-                }
-            });
+            self.schedule_deadline(vote_id.clone(), Duration::from_secs(secs), broker, store);
         }
 
         vote
@@ -170,8 +204,7 @@ impl VoteManager {
             started_by: started_by.to_string(),
         };
 
-        self.active_elections
-            .insert(room_id.to_string(), election);
+        self.active_elections.insert(room_id.to_string(), election);
 
         // Spawn timer: after 2 seconds, pick the leader
         let active_elections = self.active_elections.clone();
@@ -218,7 +251,12 @@ impl VoteManager {
                     }),
                 );
                 broker.broadcast_to_room_all(&room_id, &event);
-                log::info!("Leader elected in {}: {} ({})", room_id, winner_name, winner_id);
+                log::info!(
+                    "Leader elected in {}: {} ({})",
+                    room_id,
+                    winner_name,
+                    winner_id
+                );
             }
         });
 
@@ -318,7 +356,10 @@ async fn close_and_broadcast_vote(vote: ActiveVote, broker: &Arc<Broker>, store:
         let _ = store.close_vote(&vote.vote_id);
     }
 
-    let event = Frame::event(FrameType::VoteResult, serde_json::to_value(&result).unwrap());
+    let event = Frame::event(
+        FrameType::VoteResult,
+        serde_json::to_value(&result).unwrap(),
+    );
     broker.broadcast_to_room_all(&vote.room_id, &event);
 
     log::info!(
