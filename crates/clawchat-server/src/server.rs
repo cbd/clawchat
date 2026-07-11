@@ -59,6 +59,10 @@ pub struct ServerConfig {
     pub no_auth: bool,
     /// Explicit test/development escape hatch. Production defaults to false.
     pub allow_private_webhooks: bool,
+    pub http_signup_enabled: bool,
+    pub http_admin_secret: Option<String>,
+    pub http_allowed_origins: Vec<String>,
+    pub trust_forwarded_for: bool,
 }
 
 pub struct ClawChatServer {
@@ -253,6 +257,10 @@ impl ClawChatServer {
                 reconnect_mgr: self.reconnect_mgr.clone(),
                 task_mgr: self.task_mgr.clone(),
                 webhook_mgr: self.webhook_mgr.clone(),
+                signup_enabled: self.config.http_signup_enabled,
+                admin_secret: self.config.http_admin_secret.clone(),
+                allowed_origins: self.config.http_allowed_origins.clone(),
+                trust_forwarded_for: self.config.trust_forwarded_for,
             };
             let router = crate::web::router(app_state);
             let listener = tokio::net::TcpListener::bind(addr).await?;

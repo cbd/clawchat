@@ -21,6 +21,7 @@ pub struct ActiveVote {
     pub closes_at: Option<chrono::DateTime<chrono::Utc>>,
     pub ballots: Vec<(String, String, usize)>, // (agent_id, agent_name, option_index)
     pub eligible_voters: usize,
+    pub eligible_agents: HashSet<String>,
     pub is_ephemeral: bool, // true if in an ephemeral room
 }
 
@@ -53,6 +54,11 @@ impl VoteManager {
         if let Ok(votes) = store.list_open_votes() {
             for meta in votes {
                 let ballots = store.get_vote_ballots(&meta.vote_id).unwrap_or_default();
+                let eligible_agents = store
+                    .get_vote_eligible_agents(&meta.vote_id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect::<HashSet<_>>();
                 let vote = ActiveVote {
                     vote_id: meta.vote_id.clone(),
                     room_id: meta.room_id,
@@ -64,6 +70,7 @@ impl VoteManager {
                     closes_at: meta.closes_at,
                     ballots,
                     eligible_voters: meta.eligible_voters,
+                    eligible_agents,
                     is_ephemeral: false,
                 };
                 manager.active_votes.insert(meta.vote_id.clone(), vote);
@@ -104,7 +111,7 @@ impl VoteManager {
         options: Vec<String>,
         created_by: String,
         duration_secs: Option<u64>,
-        eligible_voters: usize,
+        eligible_agents: Vec<String>,
         is_ephemeral: bool,
         broker: Arc<Broker>,
         store: Arc<Store>,
@@ -122,7 +129,8 @@ impl VoteManager {
             created_at: now,
             closes_at,
             ballots: Vec::new(),
-            eligible_voters,
+            eligible_voters: eligible_agents.len(),
+            eligible_agents: eligible_agents.into_iter().collect(),
             is_ephemeral,
         };
 
@@ -158,6 +166,10 @@ impl VoteManager {
 
             if option_index >= vote.options.len() {
                 return Err(ErrorCode::InvalidOption);
+            }
+
+            if !vote.eligible_agents.contains(agent_id) {
+                return Err(ErrorCode::AccessDenied);
             }
 
             // Check not already voted

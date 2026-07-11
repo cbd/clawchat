@@ -4,6 +4,7 @@ use dashmap::DashMap;
 use std::sync::Arc;
 
 use crate::store::Store;
+use crate::store::StoreError;
 
 /// In-memory task tracking for rooms. Tasks are lightweight work items that
 /// agents can assign, update, and query — filling the gap between unstructured
@@ -34,7 +35,7 @@ impl TaskManager {
         description: Option<String>,
         assignee: Option<String>,
         created_by: String,
-    ) -> TaskInfo {
+    ) -> Result<TaskInfo, StoreError> {
         let now = Utc::now();
         let task = TaskInfo {
             task_id: task_id.clone(),
@@ -48,11 +49,9 @@ impl TaskManager {
             updated_at: None,
             note: None,
         };
+        self.store.save_task(&task)?;
         self.tasks.insert(task_id, task.clone());
-        if let Err(error) = self.store.save_task(&task) {
-            log::warn!("task persistence failed: {error}");
-        }
-        task
+        Ok(task)
     }
 
     /// Update a task's status, assignee, and/or note. Returns the updated task.
@@ -62,9 +61,11 @@ impl TaskManager {
         status: Option<String>,
         assignee: Option<String>,
         note: Option<String>,
-    ) -> Option<TaskInfo> {
-        let mut entry = self.tasks.get_mut(task_id)?;
-        let task = entry.value_mut();
+    ) -> Result<Option<TaskInfo>, StoreError> {
+        let Some(existing) = self.tasks.get(task_id).map(|entry| entry.value().clone()) else {
+            return Ok(None);
+        };
+        let mut task = existing;
 
         if let Some(s) = status {
             task.status = s;
@@ -77,11 +78,9 @@ impl TaskManager {
         }
         task.updated_at = Some(Utc::now());
 
-        let updated = task.clone();
-        if let Err(error) = self.store.save_task(&updated) {
-            log::warn!("task persistence failed: {error}");
-        }
-        Some(updated)
+        self.store.save_task(&task)?;
+        self.tasks.insert(task_id.to_string(), task.clone());
+        Ok(Some(task))
     }
 
     /// List tasks in a room, optionally filtered by status.
@@ -111,20 +110,65 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&dir.path().join("tasks.db")).unwrap());
         let manager = TaskManager::new(store.clone());
-        manager.create_task(
-            "task-1".into(),
-            "lobby".into(),
-            "Persist me".into(),
-            None,
-            Some("agent".into()),
-            "creator".into(),
-        );
-        manager.update_task("task-1", Some("in_progress".into()), None, None);
+        manager
+            .create_task(
+                "task-1".into(),
+                "lobby".into(),
+                "Persist me".into(),
+                None,
+                Some("agent".into()),
+                "creator".into(),
+            )
+            .unwrap();
+        manager
+            .update_task("task-1", Some("in_progress".into()), None, None)
+            .unwrap();
         drop(manager);
 
         let restored = TaskManager::new(store);
         let task = restored.get_task("task-1").expect("task must reload");
         assert_eq!(task.status, "in_progress");
         assert_eq!(task.assignee.as_deref(), Some("agent"));
+    }
+
+    #[test]
+    fn persistence_failure_does_not_acknowledge_or_mutate_task_state() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let manager = TaskManager::new(store);
+        let create = manager.create_task(
+            "bad-create".into(),
+            "missing-room".into(),
+            "Must fail".into(),
+            None,
+            None,
+            "creator".into(),
+        );
+        assert!(create.is_err());
+        assert!(manager.get_task("bad-create").is_none());
+
+        let now = Utc::now();
+        manager.tasks.insert(
+            "bad-update".into(),
+            TaskInfo {
+                task_id: "bad-update".into(),
+                room_id: "missing-room".into(),
+                title: "Must stay pending".into(),
+                description: None,
+                status: "pending".into(),
+                assignee: None,
+                created_by: "creator".into(),
+                created_at: now,
+                updated_at: None,
+                note: None,
+            },
+        );
+        let update = manager.update_task(
+            "bad-update",
+            Some("completed".into()),
+            None,
+            Some("not persisted".into()),
+        );
+        assert!(update.is_err());
+        assert_eq!(manager.get_task("bad-update").unwrap().status, "pending");
     }
 }

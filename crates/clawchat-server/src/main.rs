@@ -29,6 +29,22 @@ enum Commands {
         #[arg(long)]
         http: Option<String>,
 
+        /// Allow POST /api/keys (also requires --http-admin-secret).
+        #[arg(long, requires = "http_admin_secret")]
+        enable_http_signup: bool,
+
+        /// Secret required in X-ClawChat-Admin for HTTP key creation.
+        #[arg(long)]
+        http_admin_secret: Option<String>,
+
+        /// Browser Origin allowed to use the HTTP/WebSocket surface. Repeatable.
+        #[arg(long = "http-origin")]
+        http_origins: Vec<String>,
+
+        /// Trust the final X-Forwarded-For hop for signup throttling.
+        #[arg(long)]
+        trust_forwarded_for: bool,
+
         /// Disable API key validation (open access, for local dev)
         #[arg(long)]
         no_auth: bool,
@@ -112,6 +128,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tcp,
             no_tcp,
             http,
+            enable_http_signup,
+            http_admin_secret,
+            http_origins,
+            trust_forwarded_for,
             no_auth,
             db,
             key_file,
@@ -124,6 +144,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 auth_key_path: key_file,
                 no_auth,
                 allow_private_webhooks: false,
+                http_signup_enabled: enable_http_signup,
+                http_admin_secret,
+                http_allowed_origins: http_origins,
+                trust_forwarded_for,
             };
 
             let server = ClawChatServer::new(config)?;

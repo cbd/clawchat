@@ -1190,7 +1190,12 @@ async fn handle_list_agents(
                 .filter_map(|id| broker.agents.get(id).map(|a| a.info.clone()))
                 .collect()
         }
-        None => broker.agents.iter().map(|a| a.info.clone()).collect(),
+        None => broker
+            .agents
+            .iter()
+            .filter(|agent| no_auth || agent.api_key == agent_api_key)
+            .map(|agent| agent.info.clone())
+            .collect(),
     };
 
     Frame {
@@ -1300,7 +1305,8 @@ async fn handle_create_vote(
     }
 
     let vote_id = uuid::Uuid::new_v4().to_string();
-    let eligible = broker.get_room_members(&p.room_id).len();
+    let eligible_agents = broker.get_room_members(&p.room_id);
+    let eligible = eligible_agents.len();
     let is_ephemeral = ephemeral_rooms.contains_key(&p.room_id);
 
     // Persist to SQLite if not ephemeral
@@ -1316,7 +1322,7 @@ async fn handle_create_vote(
             &p.options,
             agent_id,
             closes_at,
-            eligible,
+            &eligible_agents,
         ) {
             return Frame::error(
                 req_id,
@@ -1334,7 +1340,7 @@ async fn handle_create_vote(
         p.options.clone(),
         agent_id.to_string(),
         p.duration_secs,
-        eligible,
+        eligible_agents,
         is_ephemeral,
         broker.clone(),
         store.clone(),
@@ -1382,22 +1388,31 @@ async fn handle_cast_vote(
     };
 
     // Check if vote is active (in-memory)
-    let (is_ephemeral, option_count, room_id) = match vote_mgr.active_votes.get(&p.vote_id) {
-        Some(vote) => (
-            vote.is_ephemeral,
-            Some(vote.options.len()),
-            Some(vote.room_id.clone()),
-        ),
-        None => (
-            false,
-            None,
-            store
-                .get_vote_meta(&p.vote_id)
-                .ok()
-                .flatten()
-                .map(|vote| vote.room_id),
-        ),
-    };
+    let (is_ephemeral, option_count, room_id, eligible) =
+        match vote_mgr.active_votes.get(&p.vote_id) {
+            Some(vote) => (
+                vote.is_ephemeral,
+                Some(vote.options.len()),
+                Some(vote.room_id.clone()),
+                vote.eligible_agents.contains(agent_id),
+            ),
+            None => {
+                let eligible = store
+                    .get_vote_eligible_agents(&p.vote_id)
+                    .map(|agents| agents.iter().any(|candidate| candidate == agent_id))
+                    .unwrap_or(false);
+                (
+                    false,
+                    None,
+                    store
+                        .get_vote_meta(&p.vote_id)
+                        .ok()
+                        .flatten()
+                        .map(|vote| vote.room_id),
+                    eligible,
+                )
+            }
+        };
 
     let Some(room_id) = room_id else {
         return Frame::error(
@@ -1409,6 +1424,15 @@ async fn handle_cast_vote(
         return Frame::error(
             req_id,
             ErrorPayload::new(ErrorCode::NotInRoom, "Must be in room to vote"),
+        );
+    }
+    if !eligible {
+        return Frame::error(
+            req_id,
+            ErrorPayload::new(
+                ErrorCode::AccessDenied,
+                "Agent was not eligible when vote opened",
+            ),
         );
     }
 
@@ -2064,14 +2088,22 @@ async fn handle_assign_task(
     }
 
     let task_id = uuid::Uuid::new_v4().to_string();
-    let task = task_mgr.create_task(
+    let task = match task_mgr.create_task(
         task_id,
         p.room_id.clone(),
         p.title,
         p.description,
         p.assignee,
         agent_id.to_string(),
-    );
+    ) {
+        Ok(task) => task,
+        Err(error) => {
+            return Frame::error(
+                req_id,
+                ErrorPayload::new(ErrorCode::InternalError, error.to_string()),
+            )
+        }
+    };
 
     // Broadcast to room
     let event = Frame::event(
@@ -2119,14 +2151,18 @@ async fn handle_update_task(
     }
 
     match task_mgr.update_task(&p.task_id, p.status, p.assignee, p.note) {
-        Some(task) => {
+        Ok(Some(task)) => {
             let event = Frame::event(FrameType::TaskUpdated, serde_json::to_value(&task).unwrap());
             broker.broadcast_to_room_all(&room_id, &event);
             Frame::ok(req_id, serde_json::to_value(&task).unwrap())
         }
-        None => Frame::error(
+        Ok(None) => Frame::error(
             req_id,
             ErrorPayload::new(ErrorCode::TaskNotFound, "Task not found"),
+        ),
+        Err(error) => Frame::error(
+            req_id,
+            ErrorPayload::new(ErrorCode::InternalError, error.to_string()),
         ),
     }
 }

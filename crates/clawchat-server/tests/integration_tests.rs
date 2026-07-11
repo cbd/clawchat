@@ -30,6 +30,10 @@ async fn start_test_server() -> (
         auth_key_path: key_path,
         no_auth: false,
         allow_private_webhooks: true,
+        http_signup_enabled: false,
+        http_admin_secret: None,
+        http_allowed_origins: vec![],
+        trust_forwarded_for: false,
     };
 
     let server = ClawChatServer::new(config).unwrap();
@@ -520,6 +524,39 @@ async fn test_agent_list() {
 }
 
 #[tokio::test]
+async fn test_global_agent_list_is_scoped_to_api_key() {
+    let (_handle, addr, key_a, tmp) = start_test_server().await;
+    let key_b = "agent-list-other-key";
+    rusqlite::Connection::open(tmp.path().join("test.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO api_keys (api_key, label) VALUES (?1, 'other')",
+            [key_b],
+        )
+        .unwrap();
+    let agent_a = connect_agent(&addr, &key_a, "agent-a").await;
+    let agent_b = ClawChatClient::connect_tcp(&addr, key_b, "agent-b", None, vec![])
+        .await
+        .unwrap();
+    let visible_a = agent_a.list_agents(None).await.unwrap();
+    let visible_b = agent_b.list_agents(None).await.unwrap();
+    assert_eq!(
+        visible_a
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["agent-a"]
+    );
+    assert_eq!(
+        visible_b
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["agent-b"]
+    );
+}
+
+#[tokio::test]
 async fn test_mention_is_constrained_to_room_members() {
     let (_handle, addr, key, tmp) = start_test_server().await;
     let other_key = "mention-outsider-key";
@@ -741,8 +778,12 @@ async fn test_get_vote_status_after_close_returns_tally() {
 #[tokio::test]
 async fn test_open_vote_and_ballots_survive_server_restart() {
     let (handle, addr, key, tmp) = start_test_server().await;
-    let first = connect_agent(&addr, &key, "first").await;
-    let second = connect_agent(&addr, &key, "second").await;
+    let first = ClawChatClient::connect_tcp(&addr, &key, "first", Some("vote-first"), vec![])
+        .await
+        .unwrap();
+    let second = ClawChatClient::connect_tcp(&addr, &key, "second", Some("vote-second"), vec![])
+        .await
+        .unwrap();
     first.join_room("lobby").await.unwrap();
     second.join_room("lobby").await.unwrap();
     let vote = first
@@ -772,16 +813,50 @@ async fn test_open_vote_and_ballots_survive_server_restart() {
         auth_key_path: tmp.path().join("auth.key"),
         no_auth: false,
         allow_private_webhooks: true,
+        http_signup_enabled: false,
+        http_admin_secret: None,
+        http_allowed_origins: vec![],
+        trust_forwarded_for: false,
     })
     .unwrap();
     let restarted_handle = tokio::spawn(async move {
         let _ = restarted.run().await;
     });
     sleep(Duration::from_millis(100)).await;
-    let first = connect_agent(&restarted_addr, &key, "first-after").await;
-    let second = connect_agent(&restarted_addr, &key, "second-after").await;
+    let first = ClawChatClient::connect_tcp(
+        &restarted_addr,
+        &key,
+        "first-after",
+        Some("vote-first"),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let second = ClawChatClient::connect_tcp(
+        &restarted_addr,
+        &key,
+        "second-after",
+        Some("vote-second"),
+        vec![],
+    )
+    .await
+    .unwrap();
+    let replacement = ClawChatClient::connect_tcp(
+        &restarted_addr,
+        &key,
+        "replacement",
+        Some("vote-replacement"),
+        vec![],
+    )
+    .await
+    .unwrap();
     first.join_room("lobby").await.unwrap();
     second.join_room("lobby").await.unwrap();
+    replacement.join_room("lobby").await.unwrap();
+    assert!(
+        replacement.cast_vote(&vote.vote_id, 0).await.is_err(),
+        "a replacement room member must not enter the frozen electorate"
+    );
     second.cast_vote(&vote.vote_id, 1).await.unwrap();
     let status = first.get_vote_status(&vote.vote_id).await.unwrap();
     assert_eq!(status.status, VoteStatus::Closed);
@@ -2667,6 +2742,10 @@ async fn test_agent_id_ownership_survives_server_restart() {
         auth_key_path: tmp.path().join("auth.key"),
         no_auth: false,
         allow_private_webhooks: true,
+        http_signup_enabled: false,
+        http_admin_secret: None,
+        http_allowed_origins: vec![],
+        trust_forwarded_for: false,
     })
     .unwrap();
     let restarted_handle = tokio::spawn(async move {

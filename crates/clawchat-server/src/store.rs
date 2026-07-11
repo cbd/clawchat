@@ -25,10 +25,22 @@ pub struct VoteMeta {
 impl Store {
     pub fn open(path: &Path) -> Result<Self, rusqlite::Error> {
         let conn = Connection::open(path)?;
+        crate::auth::harden_file_permissions(path)
+            .map_err(|_| rusqlite::Error::InvalidPath(path.to_path_buf()))?;
         let store = Self {
             conn: Mutex::new(conn),
         };
         store.initialize()?;
+        for candidate in [
+            path.to_path_buf(),
+            std::path::PathBuf::from(format!("{}-wal", path.display())),
+            std::path::PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            if candidate.exists() {
+                crate::auth::harden_file_permissions(&candidate)
+                    .map_err(|_| rusqlite::Error::InvalidPath(candidate))?;
+            }
+        }
         Ok(store)
     }
 
@@ -129,6 +141,12 @@ impl Store {
                 agent_name   TEXT NOT NULL,
                 option_index INTEGER NOT NULL,
                 cast_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+                PRIMARY KEY (vote_id, agent_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS vote_eligible_agents (
+                vote_id  TEXT NOT NULL REFERENCES votes(vote_id) ON DELETE CASCADE,
+                agent_id TEXT NOT NULL,
                 PRIMARY KEY (vote_id, agent_id)
             );
 
@@ -245,6 +263,20 @@ impl Store {
                  ON CONFLICT(room_id) DO UPDATE SET
                      high_water = MAX(room_sequences.high_water, NEW.seq);
              END;",
+        )?;
+
+        // Legacy open votes stored only an eligible count. Preserve the known
+        // electorate (creator plus any already-cast ballots) and fail closed to
+        // that reconstructable set rather than admitting replacement agents.
+        conn.execute_batch(
+            "INSERT OR IGNORE INTO vote_eligible_agents (vote_id, agent_id)
+             SELECT vote_id, created_by FROM votes WHERE status = 'open';
+             INSERT OR IGNORE INTO vote_eligible_agents (vote_id, agent_id)
+             SELECT b.vote_id, b.agent_id FROM vote_ballots b
+             JOIN votes v ON v.vote_id = b.vote_id WHERE v.status = 'open';
+             UPDATE votes SET eligible_voters = (
+                 SELECT COUNT(*) FROM vote_eligible_agents e WHERE e.vote_id = votes.vote_id
+             ) WHERE status = 'open';",
         )?;
 
         Ok(())
@@ -611,16 +643,33 @@ impl Store {
         options: &[String],
         created_by: &str,
         closes_at: Option<DateTime<Utc>>,
-        eligible_voters: usize,
+        eligible_agents: &[String],
     ) -> Result<(), StoreError> {
-        let conn = self.conn.lock().unwrap();
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
         let options_json = serde_json::to_string(options).unwrap_or_default();
         let closes_str = closes_at.map(|t| t.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string());
-        conn.execute(
+        tx.execute(
             "INSERT INTO votes (vote_id, room_id, title, description, options, created_by, closes_at, eligible_voters) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![vote_id, room_id, title, description, options_json, created_by, closes_str, eligible_voters as i64],
+            params![vote_id, room_id, title, description, options_json, created_by, closes_str, eligible_agents.len() as i64],
         )?;
+        for agent_id in eligible_agents {
+            tx.execute(
+                "INSERT INTO vote_eligible_agents (vote_id, agent_id) VALUES (?1, ?2)",
+                params![vote_id, agent_id],
+            )?;
+        }
+        tx.commit()?;
         Ok(())
+    }
+
+    pub fn get_vote_eligible_agents(&self, vote_id: &str) -> Result<Vec<String>, StoreError> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT agent_id FROM vote_eligible_agents WHERE vote_id = ?1 ORDER BY agent_id",
+        )?;
+        let rows = stmt.query_map(params![vote_id], |row| row.get(0))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(StoreError::Db)
     }
 
     pub fn cast_vote(
@@ -1758,6 +1807,33 @@ mod tests {
         let store = Store::open(&path).unwrap();
         assert!(store.claim_agent_identity("stable-agent", "key-a").unwrap());
         assert!(!store.claim_agent_identity("stable-agent", "key-b").unwrap());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn test_database_permissions_are_created_and_repaired_to_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.db");
+        let store = Store::open(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        for sidecar in [
+            std::path::PathBuf::from(format!("{}-wal", path.display())),
+            std::path::PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            if sidecar.exists() {
+                assert_eq!(
+                    std::fs::metadata(sidecar).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+        }
+        drop(store);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(Store::open(&path).unwrap());
+        let repaired = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(repaired, 0o600);
     }
 
     #[test]

@@ -12,7 +12,7 @@ When multiple AI agents work on the same codebase, they need a way to coordinate
 - **Sealed-ballot voting** so agents can make group decisions without anchoring bias
 - **Leader election** with opt-out, so one agent can break ties
 - **Decisions** that are recorded as authoritative and distinct from regular messages
-- **Mentions** for cross-room notifications
+- **Mentions** for notifying current room members
 - **Message history** persisted in SQLite
 
 ## Install
@@ -42,6 +42,8 @@ The server listens on:
 - **Unix socket:** `~/.clawchat/clawchat.sock`
 
 API key is auto-generated at `~/.clawchat/auth.key`.
+
+HTTP key signup is disabled by default. If you expose the optional HTTP/WebSocket listener, configure explicit `--http-origin` values. Enabling signup also requires `--http-admin-secret`; `X-Forwarded-For` is ignored unless `--trust-forwarded-for` is set behind a trusted proxy.
 
 ## macOS app
 

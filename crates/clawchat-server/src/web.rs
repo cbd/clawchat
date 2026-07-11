@@ -3,7 +3,7 @@ use axum::{
         ws::{Message, WebSocket, WebSocketUpgrade},
         Path, State,
     },
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode, Uri},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -40,10 +40,15 @@ pub struct AppState {
     pub reconnect_mgr: Arc<ReconnectManager>,
     pub task_mgr: Arc<TaskManager>,
     pub webhook_mgr: Arc<crate::webhooks::WebhookManager>,
+    pub signup_enabled: bool,
+    pub admin_secret: Option<String>,
+    pub allowed_origins: Vec<String>,
+    pub trust_forwarded_for: bool,
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let allowed_origins = state.allowed_origins.clone();
+    let router = Router::new()
         .route("/ws", get(ws_handler))
         .route("/api/keys", post(create_api_key))
         .route("/api/status", get(api_status))
@@ -51,14 +56,49 @@ pub fn router(state: AppState) -> Router {
         .route("/api/agents", get(api_list_agents))
         .route("/api/rooms/{room_id}/history", get(api_room_history))
         .fallback(static_handler)
-        .with_state(state)
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .with_state(state);
+    let origins = allowed_origins
+        .iter()
+        .filter_map(|origin| HeaderValue::from_str(origin).ok())
+        .collect::<Vec<_>>();
+    if origins.is_empty() {
+        router
+    } else {
+        router.layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods([Method::GET, Method::POST])
+                .allow_headers([
+                    header::CONTENT_TYPE,
+                    header::HeaderName::from_static("x-clawchat-admin"),
+                    header::HeaderName::from_static("x-clawchat-key"),
+                ]),
+        )
+    }
 }
 
 // --- WebSocket handler ---
 
-async fn ws_handler(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+fn origin_allowed(headers: &HeaderMap, allowed: &[String]) -> bool {
+    let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return true;
+    };
+    allowed.iter().any(|candidate| candidate == origin)
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    if !origin_allowed(&headers, &state.allowed_origins) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     ws.on_upgrade(move |socket| handle_ws_connection(socket, state))
+        .into_response()
 }
 
 async fn handle_ws_connection(ws: WebSocket, state: AppState) {
@@ -159,15 +199,22 @@ async fn create_api_key(
     headers: HeaderMap,
     body: Option<Json<serde_json::Value>>,
 ) -> impl IntoResponse {
-    // Throttle open signup per client IP. We sit behind Caddy, which sets
-    // X-Forwarded-For; with a single trusted hop the real client is the last
-    // entry. Direct (no proxy) requests fall back to one shared "local" bucket.
-    let client_ip = headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.rsplit(',').next())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "local".to_string());
+    if !state.signup_enabled {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "HTTP signup is disabled"})),
+        );
+    }
+    let supplied_admin = headers
+        .get("x-clawchat-admin")
+        .and_then(|value| value.to_str().ok());
+    if state.admin_secret.as_deref().is_none() || supplied_admin != state.admin_secret.as_deref() {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "admin secret required"})),
+        );
+    }
+    let client_ip = signup_bucket(&headers, state.trust_forwarded_for);
     if !state.rate_limiter.try_register_signup(&client_ip) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -195,6 +242,19 @@ async fn create_api_key(
             "tier": "free",
         })),
     )
+}
+
+fn signup_bucket(headers: &HeaderMap, trust_forwarded_for: bool) -> String {
+    if trust_forwarded_for {
+        if let Some(value) = headers
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.rsplit(',').next())
+        {
+            return value.trim().to_string();
+        }
+    }
+    "direct".to_string()
 }
 
 async fn api_status(State(state): State<AppState>) -> impl IntoResponse {
@@ -227,11 +287,24 @@ async fn api_list_rooms(State(state): State<AppState>) -> impl IntoResponse {
     Json(serde_json::json!({"rooms": rooms}))
 }
 
-async fn api_list_agents(State(state): State<AppState>) -> impl IntoResponse {
+async fn api_list_agents(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> axum::response::Response {
+    let Some(key) = headers
+        .get("x-clawchat-key")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    if key != state.api_key && !state.store.validate_api_key(key).unwrap_or(false) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
     let agents: Vec<serde_json::Value> = state
         .broker
         .agents
         .iter()
+        .filter(|agent| state.no_auth || agent.api_key == key)
         .map(|a| {
             serde_json::json!({
                 "agent_id": a.info.agent_id,
@@ -241,7 +314,7 @@ async fn api_list_agents(State(state): State<AppState>) -> impl IntoResponse {
         })
         .collect();
 
-    Json(serde_json::json!({"agents": agents}))
+    Json(serde_json::json!({"agents": agents})).into_response()
 }
 
 async fn api_room_history(
@@ -303,5 +376,90 @@ async fn static_handler(uri: Uri) -> impl IntoResponse {
                 None => StatusCode::NOT_FOUND.into_response(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let broker = Arc::new(Broker::new(
+            Arc::new(DashMap::new()),
+            Arc::new(DashMap::new()),
+        ));
+        AppState {
+            broker: broker.clone(),
+            store: store.clone(),
+            ephemeral_rooms: Arc::new(DashMap::new()),
+            vote_mgr: Arc::new(VoteManager::new(store.clone(), broker)),
+            rate_limiter: Arc::new(RateLimiter::new()),
+            no_auth: false,
+            api_key: "master".into(),
+            reconnect_mgr: Arc::new(ReconnectManager::new()),
+            task_mgr: Arc::new(TaskManager::new(store.clone())),
+            webhook_mgr: Arc::new(crate::webhooks::WebhookManager::new(store, true)),
+            signup_enabled: false,
+            admin_secret: None,
+            allowed_origins: vec![],
+            trust_forwarded_for: false,
+        }
+    }
+
+    #[test]
+    fn browser_origin_must_be_explicitly_allowed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://evil.example"),
+        );
+        assert!(!origin_allowed(
+            &headers,
+            &["https://clawchat.example".into()]
+        ));
+        assert!(origin_allowed(&headers, &["https://evil.example".into()]));
+    }
+
+    #[test]
+    fn forged_forwarded_for_is_ignored_without_trusted_proxy_mode() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("203.0.113.10, 198.51.100.20"),
+        );
+        assert_eq!(signup_bucket(&headers, false), "direct");
+        assert_eq!(signup_bucket(&headers, true), "198.51.100.20");
+    }
+
+    #[tokio::test]
+    async fn signup_requires_explicit_mode_and_admin_secret() {
+        let disabled = create_api_key(State(test_state()), HeaderMap::new(), None)
+            .await
+            .into_response();
+        assert_eq!(disabled.status(), StatusCode::FORBIDDEN);
+
+        let mut enabled = test_state();
+        enabled.signup_enabled = true;
+        enabled.admin_secret = Some("admin-secret".into());
+        let missing = create_api_key(State(enabled.clone()), HeaderMap::new(), None)
+            .await
+            .into_response();
+        assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::HeaderName::from_static("x-clawchat-admin"),
+            HeaderValue::from_static("admin-secret"),
+        );
+        let created = create_api_key(State(enabled), headers, None)
+            .await
+            .into_response();
+        assert_eq!(created.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn global_agent_rest_endpoint_requires_a_key() {
+        let response = api_list_agents(State(test_state()), HeaderMap::new()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
