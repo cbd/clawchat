@@ -9,7 +9,10 @@ let package = Package(
         .executable(name: "ClawChatMac", targets: ["ClawChatMac"]),
     ],
     targets: [
-        .executableTarget(name: "ClawChatMac"),
+        .executableTarget(
+            name: "ClawChatMac",
+            resources: [.process("Resources")]
+        ),
         .testTarget(name: "ClawChatMacTests", dependencies: ["ClawChatMac"]),
     ],
     swiftLanguageVersions: [.v5]

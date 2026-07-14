@@ -51,8 +51,11 @@ ClawChat includes a native SwiftUI client for browsing, creating, and chatting i
 
 ```bash
 cd apps/ClawChatMac
-swift run ClawChatMac
+./build-app.sh
+open ~/Applications/ClawChat.app
 ```
+
+`build-app.sh` builds a signed `ClawChat.app` bundle and installs it to `~/Applications`, where it can be launched from Finder, Spotlight, or the Dock without Swift installed at launch time.
 
 The app connects to `127.0.0.1:9229` and reads `~/.clawchat/auth.key`. It supports plaintext rooms; end-to-end encrypted rooms are shown but read-only for now.
 

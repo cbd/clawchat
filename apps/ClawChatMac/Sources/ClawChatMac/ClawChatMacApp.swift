@@ -6,6 +6,23 @@ final class ClawChatAppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillFinishLaunching(_ notification: Notification) {
         NSApplication.shared.setActivationPolicy(.regular)
+        if let icon = Self.applicationIcon() {
+            NSApplication.shared.applicationIconImage = icon
+        }
+    }
+
+    static func applicationIcon() -> NSImage? {
+        if let iconURL = Bundle.main.url(forResource: "ClawChatIcon", withExtension: "png") {
+            return NSImage(contentsOf: iconURL)
+        }
+
+        #if DEBUG
+        if let iconURL = Bundle.module.url(forResource: "ClawChatIcon", withExtension: "png") {
+            return NSImage(contentsOf: iconURL)
+        }
+        #endif
+
+        return nil
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
